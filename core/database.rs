@@ -218,6 +218,7 @@ pub struct DatabaseAllocators<
 pub struct OpenOptions {
     /// Pre-opened database storage for the file at the database path.
     storage: Option<Arc<dyn DatabaseStorage>>,
+    storage_factory: Option<Arc<dyn Fn() -> Result<Arc<dyn DatabaseStorage>> + Send + Sync>>,
     /// WAL file path override. Defaults to `"{path}-wal"`. Only honored by
     /// [`Database::do_open`]/[`Database::do_open_async`]; the registry-aware
     /// [`Database::open`]/[`Database::open_async`] reject it, because the
@@ -241,6 +242,7 @@ impl OpenOptions {
     pub fn new(dialect: Arc<dyn Dialect>) -> Self {
         Self {
             storage: None,
+            storage_factory: None,
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
@@ -254,6 +256,17 @@ impl OpenOptions {
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Creates physical storage only after reserving the canonical registry
+    /// entry for an existing file. Cache hits never invoke the factory or
+    /// open another descriptor. New files must be created exclusively first.
+    pub fn storage_factory(
+        mut self,
+        factory: Arc<dyn Fn() -> Result<Arc<dyn DatabaseStorage>> + Send + Sync>,
+    ) -> Self {
+        self.storage_factory = Some(factory);
         self
     }
 
@@ -510,6 +523,7 @@ pub struct OpenDbAsyncState {
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry key for insertion (computed once at start)
     pub(crate) registry_key: Option<DatabaseKey>,
+    resolved_storage: Option<Arc<dyn DatabaseStorage>>,
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
@@ -540,6 +554,7 @@ impl OpenDbAsyncState {
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
             registry_key: None,
+            resolved_storage: None,
             building_db: None,
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
@@ -922,6 +937,11 @@ impl Database {
     }
 
     fn validate_open_options(options: &OpenOptions) -> Result<()> {
+        if options.storage.is_some() && options.storage_factory.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "storage and storage_factory are mutually exclusive".into(),
+            ));
+        }
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -1041,6 +1061,7 @@ impl Database {
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
+        flags: OpenFlags,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -1070,8 +1091,19 @@ impl Database {
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
+        Self::check_registry_open_flags(&db, flags)?;
 
         Ok(Some(db))
+    }
+
+    fn check_registry_open_flags(db: &Database, requested: OpenFlags) -> Result<()> {
+        // File and log handles belong to the registered owner. A writable
+        // connection cannot upgrade an existing read-only owner's handles;
+        // callers must drain it before reopening with writable authority.
+        if db.is_readonly() && !requested.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
@@ -1136,6 +1168,7 @@ impl Database {
                 &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
+                options.flags,
             )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
@@ -1222,7 +1255,7 @@ impl Database {
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
         Self::validate_open_options(&options)?;
-        if options.storage.is_none() {
+        if options.storage.is_none() && options.storage_factory.is_none() {
             if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
                 return Ok(db);
             }
@@ -1240,7 +1273,7 @@ impl Database {
 
     /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
     /// loop and passes `state` between calls. `OpenOptions::storage` must be
-    /// set.
+    /// set, or a `storage_factory` must provide it after registry reservation.
     ///
     /// This matters for the sync engine, which must yield on IO when the
     /// schema table spans multiple pages (potentially needing network IO to
@@ -1261,12 +1294,6 @@ impl Database {
     ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
-        let Some(storage) = options.storage.clone() else {
-            return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::open_async".to_string(),
-            )
-            .into());
-        };
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
         // Callers may hand us default flags on every poll, so this runs each
@@ -1280,13 +1307,23 @@ impl Database {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
-        if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
+        if matches!(state.phase, OpenDbAsyncPhase::Init)
+            && state.registry_key.is_none()
+            && !is_memory_like(path)
+        {
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
 
             // Look up by file identity (dev, ino). If file doesn't exist
             // yet (CREATE mode), skip lookup — no cached entry is possible.
-            if let Ok(file_id) = io.file_id(path) {
+            let file_id = match io.file_id(path) {
+                Ok(id) => Some(id),
+                // A lazy factory needs an existing physical identity to reserve.
+                // New-file callers create exclusively before using this path.
+                Err(error) if options.storage_factory.is_some() => return Err(error.into()),
+                Err(_) => None,
+            };
+            if let Some(file_id) = file_id {
                 let key = DatabaseKey::File(file_id);
                 match registry.get(&key) {
                     Some(RegistryEntry::Ready(weak)) => {
@@ -1304,6 +1341,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_open_flags(&db, flags)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1326,6 +1364,31 @@ impl Database {
             // Lock is dropped here — the Opening sentinel prevents concurrent opens
             // of the same path without holding the mutex across yields.
         }
+
+        if state.resolved_storage.is_none() {
+            let storage = match (&options.storage, &options.storage_factory) {
+                (Some(storage), None) => Ok(Arc::clone(storage)),
+                (None, Some(factory)) => factory(),
+                _ => Err(LimboError::InvalidArgument(
+                    "exactly one storage or storage_factory is required for Database::open_async"
+                        .into(),
+                )),
+            };
+            match storage {
+                Ok(storage) => state.resolved_storage = Some(storage),
+                Err(error) => {
+                    if let Some(key) = state.registry_key.take() {
+                        DATABASE_MANAGER.lock().remove(&key);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        let storage = state
+            .resolved_storage
+            .as_ref()
+            .ok_or_else(|| LimboError::InvalidArgument("database storage was not resolved".into()))?
+            .clone();
 
         // Open the database (no registry lock held; never re-consults it).
         let result = Self::do_open_async_guarded(
@@ -1371,6 +1434,11 @@ impl Database {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
         Self::validate_open_options(&options)?;
+        if options.storage_factory.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "storage_factory requires a registry-aware open".into(),
+            ));
+        }
         if options.storage.is_none() {
             // `use_registry = false`: the raw path never consults the registry,
             // so this only opens the file and never returns a cached Database.
@@ -3603,6 +3671,56 @@ mod database_tests {
         DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
         OpenOptions, PlatformIO, SqliteDialect, IO,
     };
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn lazy_storage_registry_reuses_owner_and_refuses_writable_upgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lazy-open.db");
+        let path = path.to_str().unwrap().to_owned();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let seed =
+            Database::open(io.clone(), &path, OpenOptions::new(Arc::new(SqliteDialect))).unwrap();
+        let connection = seed.connect().unwrap();
+        connection
+            .execute("CREATE TABLE retained(value INTEGER)")
+            .unwrap();
+        connection.close().unwrap();
+        drop(connection);
+        drop(seed);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let open = |flags| {
+            let factory_io = Arc::clone(&io);
+            let factory_path = path.clone();
+            let calls = Arc::clone(&calls);
+            Database::open(
+                Arc::clone(&io),
+                &path,
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .flags(flags)
+                    .storage_factory(Arc::new(move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let file = factory_io.open_file(&factory_path, flags, false)?;
+                        Ok(Arc::new(DatabaseFile::new(file)) as Arc<dyn DatabaseStorage>)
+                    })),
+            )
+        };
+        let first = open(OpenFlags::ReadOnly).unwrap();
+        let second = open(OpenFlags::ReadOnly).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(open(OpenFlags::default()), Err(LimboError::Busy)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(second);
+        drop(first);
+        let writable = open(OpenFlags::default()).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        writable
+            .connect()
+            .unwrap()
+            .execute("INSERT INTO retained VALUES (1)")
+            .unwrap();
+    }
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {

@@ -103,7 +103,7 @@ impl Default for IOContext {
 /// The purpose of this trait is to abstract the upper layers of Limbo from
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
-pub trait DatabaseStorage: Send + Sync {
+pub trait DatabaseStorage: std::any::Any + Send + Sync {
     /// Reads the encoded prefix of page 1 without applying a page transform.
     ///
     /// This is only for bootstrapping the page layout before a complete page
@@ -363,6 +363,10 @@ impl DatabaseStorage for DatabaseFile {
 impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }
+    }
+
+    pub fn file(&self) -> &Arc<dyn crate::io::File> {
+        &self.file
     }
 }
 

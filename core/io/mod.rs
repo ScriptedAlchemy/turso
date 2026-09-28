@@ -150,7 +150,7 @@ pub trait SharedWalMappedRegion: Send + Sync {
     }
 }
 
-pub trait File: Send + Sync {
+pub trait File: std::any::Any + Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
