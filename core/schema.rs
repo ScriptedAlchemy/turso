@@ -2475,12 +2475,9 @@ impl Schema {
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
+            // Foreign keys require a declared parent column. A column named
+            // rowid may be valid, but the implicit rowid is not a parent key.
+            let pos = parent_tbl.get_column(pc).map(|(i, _)| i);
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
@@ -2489,19 +2486,10 @@ impl Schema {
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
         }
 
-        // A single-column parent key is the rowid when it names rowid/_rowid_/oid
-        // or points at an INTEGER PRIMARY KEY rowid alias.
-        let parent_uses_rowid = parent_cols.len() == 1 && {
-            let pc = parent_cols[0].as_str();
-            ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r))
-                || parent_tbl.columns.iter().any(|col| {
-                    col.is_rowid_alias()
-                        && col
-                            .name
-                            .as_deref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(pc))
-                })
-        };
+        // A declared column named rowid can also be an ordinary indexed
+        // column; only the schema's INTEGER PRIMARY KEY alias uses rowid probes.
+        let parent_uses_rowid =
+            parent_cols.len() == 1 && parent_tbl.columns[parent_pos[0]].is_rowid_alias();
 
         let parent_unique_index = if parent_uses_rowid {
             None
@@ -2525,7 +2513,6 @@ impl Schema {
             found
         };
 
-        fk.validate()?;
         Ok(ResolvedFkRef {
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
@@ -5130,22 +5117,6 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
     crate::LimboError::ForeignKeyConstraint(format!(
         "foreign key mismatch - \"{child}\" referencing \"{parent}\""
     ))
-}
-
-impl ForeignKey {
-    fn validate(&self) -> Result<()> {
-        if self
-            .parent_columns
-            .iter()
-            .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
-        {
-            return Err(crate::LimboError::ForeignKeyConstraint(format!(
-                "foreign key mismatch referencing \"{}\"",
-                self.parent_table
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// A single resolved foreign key where `parent_table == target`.

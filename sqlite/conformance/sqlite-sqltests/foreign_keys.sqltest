@@ -4401,3 +4401,43 @@ snapshot fk-upsert-column-no-child-points-at {
 snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
 }
+
+
+@cross-check-integrity
+test fk-declared-rowid-primary-key-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE payload(rowid INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT);
+    CREATE TABLE digest(payload_rowid INTEGER REFERENCES payload(rowid) ON DELETE CASCADE);
+    INSERT INTO payload(content) VALUES ('café 東京'), ('trailing whitespace ');
+    INSERT INTO digest VALUES (1), (2);
+    DELETE FROM payload WHERE rowid=1;
+    SELECT payload_rowid FROM digest;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-declared-rowid-text-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(rowid TEXT UNIQUE);
+    CREATE TABLE child(value TEXT REFERENCES parent(rowid) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES ('key');
+    INSERT INTO child VALUES ('key');
+    UPDATE parent SET rowid='next';
+    SELECT value FROM child;
+}
+expect {
+    next
+}
+
+@cross-check-integrity
+test fk-hidden-rowid-is-not-a-parent-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(value TEXT);
+    CREATE TABLE child(value INTEGER REFERENCES parent(rowid));
+    INSERT INTO parent VALUES ('key');
+    INSERT INTO child VALUES (1);
+}
+expect error {
+}

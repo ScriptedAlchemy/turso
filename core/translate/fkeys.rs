@@ -8,7 +8,7 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{collate::CollationSeq, emitter::Resolver},
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
@@ -984,7 +984,7 @@ fn emit_fk_parent_key_probe(
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.
-/// Handles rowid aliasing and explicit ROWID names; uses current row for non-rowid columns.
+/// Uses the rowid for declared INTEGER PRIMARY KEY aliases and current column values otherwise.
 fn build_parent_key(
     program: &mut ProgramBuilder,
     parent_bt: &BTreeTable,
@@ -1017,18 +1017,9 @@ fn build_parent_key(
         .transpose()?;
 
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let Some((pos, col)) = parent_bt.get_column(pcol) else {
-            if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-                // child column references parent rowid
-                program.emit_insn(Insn::Copy {
-                    src_reg: parent_rowid_reg,
-                    dst_reg: dest_start + i,
-                    extra_amount: 0,
-                });
-                continue;
-            }
-            return Err(LimboError::InternalError(format!("col {pcol} missing")));
-        };
+        let (pos, col) = parent_bt
+            .get_column(pcol)
+            .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
 
         if some_fk_cols_are_virtual {
             // the virtual column will need the registers we previously copied
@@ -1653,17 +1644,13 @@ fn copy_key_from_values(
     dest_start: usize,
 ) -> Result<()> {
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
+        let (pos, col) = parent_bt
+            .get_column(pcol)
+            .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
+        let src = if col.is_rowid_alias() {
             rowid_reg
         } else {
-            let (pos, col) = parent_bt
-                .get_column(pcol)
-                .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
-            if col.is_rowid_alias() {
-                rowid_reg
-            } else {
-                layout.to_register(values_start, pos)
-            }
+            layout.to_register(values_start, pos)
         };
         program.emit_insn(Insn::Copy {
             src_reg: src,
