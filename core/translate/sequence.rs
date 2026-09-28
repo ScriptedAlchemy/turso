@@ -680,7 +680,14 @@ pub(crate) fn emit_sqlite_sequence_sync(
 
     let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
 
-    // Delete every existing row matching `name = autoinc_table_name`.
+    // Reuse the first matching physical key while removing duplicate names.
+    // Allocating a fresh key on each call leaves MVCC tombstones that every
+    // subsequent sequence scan must revisit until checkpoint reclamation.
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowid_reg,
+        dest_end: None,
+    });
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -698,6 +705,16 @@ pub(crate) fn emit_sqlite_sequence_sync(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
+    let have_rowid_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: rowid_reg,
+        target_pc: have_rowid_label,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: sseq_cursor,
+        dest: rowid_reg,
+    });
+    program.preassign_label_to_next_insn(have_rowid_label);
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -713,7 +730,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     });
     program.preassign_label_to_next_insn(insert_label);
 
-    // Insert the new (name, seq) row with an auto-allocated rowid.
+    // Allocate a key only when this sequence had no existing mirror row.
     let col_base = program.alloc_registers(2);
     program.emit_insn(Insn::Copy {
         src_reg: name_reg,
@@ -733,12 +750,17 @@ pub(crate) fn emit_sqlite_sequence_sync(
         index_name: None,
         affinity_str: None,
     });
-    let rowid_reg = program.alloc_register();
+    let insert_row_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: rowid_reg,
+        target_pc: insert_row_label,
+    });
     program.emit_insn(Insn::NewRowid {
         cursor: sseq_cursor,
         rowid_reg,
         prev_largest_reg: 0,
     });
+    program.preassign_label_to_next_insn(insert_row_label);
     program.emit_insn(Insn::Insert {
         cursor: sseq_cursor,
         key_reg: rowid_reg,

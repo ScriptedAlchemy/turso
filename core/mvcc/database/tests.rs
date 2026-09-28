@@ -23029,3 +23029,80 @@ fn repeated_indexed_updates_bound_own_deleted_version_lookup() {
     reader.execute("COMMIT").unwrap();
     assert_eq!(value(&reader), 0);
 }
+
+#[test]
+fn autoincrement_sequence_reuses_physical_key_across_allocations() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE allocated(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+        .unwrap();
+    let store = db.get_mvcc_store();
+    store.set_checkpoint_threshold(-1);
+    let root = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'sqlite_sequence'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = store.get_table_id_from_root_page(root);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for _ in 0..64 {
+        conn.execute("INSERT INTO allocated(payload) VALUES ('entry')")
+            .unwrap();
+    }
+    assert_eq!(
+        get_rows(&conn, "SELECT max(id) FROM allocated")[0][0]
+            .as_int()
+            .unwrap(),
+        64
+    );
+    let retained_keys = store
+        .rows
+        .iter()
+        .filter(|row| row.key().table_id == table_id)
+        .count();
+    assert_eq!(
+        retained_keys, 1,
+        "sequence mirroring must not leave one dead physical key per allocation"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM allocated")[0][0]
+            .as_int()
+            .unwrap(),
+        0
+    );
+    // sqlite_sequence is user-writable; mirroring still removes duplicate names.
+    conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('allocated',0)")
+        .unwrap();
+    conn.execute("INSERT INTO allocated(payload) VALUES ('retained')")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM allocated")[0][0]
+            .as_int()
+            .unwrap(),
+        65
+    );
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT count(*) FROM sqlite_sequence WHERE name='allocated'"
+        )[0][0]
+            .as_int()
+            .unwrap(),
+        1
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(store);
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+    conn.execute("INSERT INTO allocated(payload) VALUES ('reopened')")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT max(id) FROM allocated")[0][0]
+            .as_int()
+            .unwrap(),
+        66
+    );
+}
