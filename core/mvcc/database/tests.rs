@@ -22954,3 +22954,78 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let conn = db.connect();
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
 }
+
+#[test]
+fn repeated_indexed_updates_bound_own_deleted_version_lookup() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE repeated (id INTEGER PRIMARY KEY, key TEXT UNIQUE, value INTEGER)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO repeated VALUES (1, 'stable', 0)")
+        .unwrap();
+    let reader = db.connect();
+    reader.execute("BEGIN").unwrap();
+    let value = |conn: &Arc<Connection>| {
+        conn.prepare("SELECT value FROM repeated WHERE key = 'stable'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()[0][0]
+            .as_int()
+            .unwrap()
+    };
+    assert_eq!(value(&reader), 0);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("SAVEPOINT before_updates").unwrap();
+    for _ in 0..256 {
+        writer.execute("INSERT INTO repeated VALUES (1, 'stable', 1) ON CONFLICT(key) DO UPDATE SET key = excluded.key, value = repeated.value + 1").unwrap();
+    }
+    assert_eq!(value(&writer), 256);
+    writer.execute("SAVEPOINT before_delete").unwrap();
+    writer.execute("DELETE FROM repeated WHERE id = 1").unwrap();
+
+    let store = db.get_mvcc_store();
+    let tx_id = writer.get_mv_tx_id().unwrap();
+    let tx = store.txs.get(&tx_id).unwrap();
+    let mut checked = 0;
+    let mut check = |versions: &RowVersions<crate::alloc::DynAllocator>| {
+        let versions = versions.read();
+        if versions.len() < 256 {
+            return;
+        }
+        let visits = std::cell::Cell::new(0);
+        assert!(store
+            .visible_version(
+                tx.value(),
+                versions.iter().inspect(|_| {
+                    visits.set(visits.get() + 1);
+                })
+            )
+            .is_none());
+        assert_eq!(
+            visits.get(),
+            1,
+            "own deletion must not rescan superseded versions"
+        );
+        checked += 1;
+    };
+    for row in store.rows.iter() {
+        check(row.value());
+    }
+    for index in store.index_rows.iter() {
+        for row in index.value().iter() {
+            check(row.value());
+        }
+    }
+    assert!(checked >= 2, "exercise both table and unique-index chains");
+    drop(tx);
+    assert_eq!(value(&reader), 0);
+    writer.execute("ROLLBACK TO before_delete").unwrap();
+    assert_eq!(value(&writer), 256);
+    writer.execute("ROLLBACK TO before_updates").unwrap();
+    assert_eq!(value(&writer), 0);
+    writer.execute("COMMIT").unwrap();
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(value(&reader), 0);
+}

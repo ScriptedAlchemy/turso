@@ -5748,11 +5748,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let row_versions_opt = rows.get(sortable_key);
                 if let Some(ref row_versions) = row_versions_opt {
                     let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
+                    if let Some(rv) = self.visible_version(tx, row_versions.iter()) {
                         return Ok(Some(rv.row.clone()));
                     }
                 }
@@ -5770,6 +5766,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    fn visible_version<'a>(
+        &self,
+        tx: &Transaction<A>,
+        versions: impl DoubleEndedIterator<Item = &'a RowVersion>,
+    ) -> Option<&'a RowVersion> {
+        for version in versions.rev() {
+            // Deleting our visible version hides the logical row, including all
+            // older versions. Keep those versions for savepoint rollback and
+            // other snapshots, but do not rescan them between delete/reinsert
+            // steps of repeated updates to the same table or index key.
+            if version.end() == Some(TxTimestampOrID::TxID(tx.tx_id)) {
+                return None;
+            }
+            if version.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+                return Some(version);
+            }
+        }
+        None
+    }
+
     /// SkipMap payload for `tx` while B-tree fallthrough is not allowed.
     fn skipmap_row_while_uncovered(
         &self,
@@ -5783,10 +5799,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
             return None;
         }
-        versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+        self.visible_version(tx, versions.iter())
             .map(|rv| rv.row.clone())
     }
 
@@ -5806,11 +5819,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
         let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
+        if let Some(rv) = self.visible_version(tx, versions.iter()) {
             return Ok(Some(rv.row.clone()));
         }
         Ok(None)
@@ -5834,11 +5843,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
         let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
+        if let Some(rv) = self.visible_version(tx, versions.iter()) {
             record.invalidate();
             record.start_serialization(rv.row.payload())?;
             return Ok(true);
@@ -6117,10 +6122,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
                 return None;
             }
-            let occupying = versions
-                .iter()
-                .rev()
-                .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
+            let occupying = self.visible_version(tx, versions.iter())?;
             take_payload.then(|| occupying.row.clone())
         };
         Some((row.key().clone(), versions_arc.clone(), payload))
@@ -6135,10 +6137,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if versions.is_empty() {
             return None;
         }
-        versions
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+        self.visible_version(tx, versions.iter())
             .map(|version| version.row.id.clone())
     }
 
