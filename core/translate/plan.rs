@@ -8,10 +8,13 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
+        expr::{
+            as_binary_components, expr_data_type, get_expr_affinity, walk_expr, StorageClassMask,
+            WalkControl,
+        },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        planner::{break_predicate_at_and_boundaries, determine_where_to_eval_term},
     },
     types::SeekOp,
     util::exprs_are_equivalent,
@@ -1460,25 +1463,44 @@ impl TableReferences {
     /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
     /// can plan a covering scan because the expression value lives inside
     /// the index key.
-    pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
+    pub fn register_expression_index_usage(
+        &mut self,
+        expr: &ast::Expr,
+        is_where_term: bool,
+    ) -> Result<()> {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
-            return;
+            return Ok(());
         };
         let Some(table_ref) = self
             .joined_tables()
             .iter()
             .find(|t| t.internal_id == table_id)
         else {
-            return;
+            return Ok(());
         };
         let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        let mut column_reference_counts = vec![0usize; table_ref.column_use_counts.len()];
+        walk_expr(expr, &mut |node| -> Result<WalkControl> {
+            if let ast::Expr::Column { column, .. } = node {
+                if let Some(count) = column_reference_counts.get_mut(*column) {
+                    *count += 1;
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
             .iter_mut()
             .find(|t| t.internal_id == table_id)
         {
-            table_ref_mut.register_expression_index_usage(normalized, columns_mask);
+            table_ref_mut.register_expression_index_usage(
+                normalized,
+                columns_mask,
+                column_reference_counts,
+                is_where_term,
+            );
         }
+        Ok(())
     }
 
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
@@ -2195,6 +2217,8 @@ pub struct ExpressionIndexUsage {
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
+    pub column_reference_counts: Vec<usize>,
+    pub is_where_term: bool,
 }
 
 /// Represents one key pair in a hash join equality condition.
@@ -2709,20 +2733,23 @@ impl JoinedTable {
         &mut self,
         normalized_expr: ast::Expr,
         columns_mask: ColumnUsedMask,
+        column_reference_counts: Vec<usize>,
+        is_where_term: bool,
     ) {
         if columns_mask.is_empty() {
             return;
         }
-        if self
-            .expression_index_usages
-            .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
-        {
+        if self.expression_index_usages.iter().any(|usage| {
+            usage.is_where_term == is_where_term
+                && exprs_are_equivalent(&usage.normalized_expr, &normalized_expr)
+        }) {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
             normalized_expr: Box::new(normalized_expr),
             columns_mask,
+            column_reference_counts,
+            is_where_term,
         });
     }
 
@@ -2735,6 +2762,10 @@ impl JoinedTable {
     ) {
         let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
         let mut any_covered = false;
+        let mut predicate_terms = Vec::new();
+        if let Some(predicate) = &index.where_clause {
+            break_predicate_at_and_boundaries(predicate, &mut predicate_terms);
+        }
         for usage in &self.expression_index_usages {
             // If the index stores the expression (e.g. idx on lower(name)), all
             // columns needed *solely* for that expression can be treated as
@@ -2743,11 +2774,10 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
+            let matches_where_clause = usage.is_where_term
+                && predicate_terms
+                    .iter()
+                    .any(|predicate| exprs_are_equivalent(predicate, &usage.normalized_expr));
 
             if index
                 .expression_to_index_pos(&usage.normalized_expr)
@@ -2759,7 +2789,7 @@ impl JoinedTable {
                     if col_idx >= coverage_counts.len() {
                         coverage_counts.resize(col_idx + 1, 0);
                     }
-                    coverage_counts[col_idx] += 1;
+                    coverage_counts[col_idx] += usage.column_reference_counts[col_idx];
                 }
             }
         }
@@ -3987,6 +4017,61 @@ mod tests {
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
+
+    #[test]
+    fn partial_case_index_covers_predicate_reads_but_not_projected_values() {
+        let db = crate::Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect)),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, provider TEXT, session_id TEXT, metadata_json TEXT)").unwrap();
+        let predicate = "metadata_json IS NOT NULL AND CASE WHEN json_valid(metadata_json) THEN json_type(metadata_json, '$.ingest_protection.lossy') = 'true' ELSE 0 END";
+        conn.execute(format!(
+            "CREATE INDEX lossy ON docs(provider, session_id) WHERE {predicate}"
+        ))
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO docs VALUES
+            (1, 'a', 'one', '{"ingest_protection":{"lossy":true}}'),
+            (2, 'a', 'two', '{"ingest_protection":{"lossy":false}}'),
+            (3, 'b', 'three', 'not json'),
+            (4, 'b', 'four', NULL)"#,
+        )
+        .unwrap();
+        let collect = |sql: String| conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+        let forced = format!("SELECT COUNT(*) FROM docs INDEXED BY lossy WHERE {predicate}");
+        assert_eq!(
+            collect(forced.clone()),
+            vec![vec![crate::Value::from_i64(1)]]
+        );
+        let forced_plan = collect(format!("EXPLAIN QUERY PLAN {forced}"));
+        let projection =
+            format!("SELECT metadata_json FROM docs INDEXED BY lossy WHERE {predicate}");
+        assert_eq!(
+            collect(projection.clone()),
+            vec![vec![crate::Value::from_text(
+                r#"{"ingest_protection":{"lossy":true}}"#.to_owned()
+            )]]
+        );
+        let projection_plan = format!("{:?}", collect(format!("EXPLAIN QUERY PLAN {projection}")));
+        assert!(
+            !projection_plan.contains("COVERING INDEX"),
+            "{projection_plan}"
+        );
+        let query = format!("SELECT COUNT(*) FROM docs WHERE {predicate}");
+        assert_eq!(
+            collect(query.clone()),
+            vec![vec![crate::Value::from_i64(1)]]
+        );
+        let plan = format!("{:?}", collect(format!("EXPLAIN QUERY PLAN {query}")));
+        assert!(
+            plan.contains("COVERING INDEX lossy"),
+            "unforced: {plan}; forced: {forced_plan:?}"
+        );
+    }
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
 

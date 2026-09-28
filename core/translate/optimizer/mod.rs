@@ -23,8 +23,8 @@ use crate::{
     },
     translate::{
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
-            walk_expr_mut, WalkControl,
+            expr_references_any_subquery, expr_references_outer_query,
+            expression_can_fail_on_input, walk_expr_mut, WalkControl,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -2069,29 +2069,30 @@ fn register_index_expression_usages_for_plan(
     )],
     group_by: Option<&GroupBy>,
     where_clause: &mut [WhereTerm],
-) {
+) -> Result<()> {
     table_references.reset_expression_index_usages();
 
     for rc in result_columns {
-        table_references.register_expression_index_usage(&rc.expr);
+        table_references.register_expression_index_usage(&rc.expr, false)?;
     }
     for (expr, _, _) in order_by {
-        table_references.register_expression_index_usage(expr);
+        table_references.register_expression_index_usage(expr, false)?;
     }
     for where_term in where_clause {
-        table_references.register_expression_index_usage(&where_term.expr);
+        table_references.register_expression_index_usage(&where_term.expr, true)?;
     }
 
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
-            table_references.register_expression_index_usage(expr);
+            table_references.register_expression_index_usage(expr, false)?;
         }
         if let Some(having) = &group_by.having {
             for expr in having {
-                table_references.register_expression_index_usage(expr);
+                table_references.register_expression_index_usage(expr, false)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
@@ -2507,7 +2508,7 @@ fn find_table_access_plan(
             order_by.as_slice(),
             group_by.as_ref(),
             where_clause,
-        );
+        )?;
     }
 
     // For single-table queries, try to optimize with custom index methods directly.
