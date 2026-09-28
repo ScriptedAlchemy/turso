@@ -721,6 +721,16 @@ fn update_pragma(
             connection.set_fts_merge_threshold(threshold);
             Ok(TransactionMode::None)
         }
+        PragmaName::SecureDelete => {
+            let enabled = match &value {
+                Expr::Literal(Literal::Numeric(number)) => number == "1",
+                _ => parse_pragma_enabled(&value),
+            };
+            if !enabled {
+                bail_parse_error!("secure_delete is always ON; OFF and FAST are unsupported");
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
@@ -1656,6 +1666,13 @@ fn query_pragma(
             let threshold = connection.get_fts_merge_threshold();
             let register = program.alloc_register();
             program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::SecureDelete => {
+            let register = program.alloc_register();
+            program.emit_int(1, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

@@ -5595,6 +5595,8 @@ impl Pager {
                             trunk_page.get().id() == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
+                        self.add_dirty(page)?;
+                        page.get_contents().as_ptr()[..header.usable_space()].fill(0);
                         self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
@@ -5623,6 +5625,7 @@ impl Pager {
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     let contents = page.get_contents();
+                    contents.as_ptr()[..header.usable_space()].fill(0);
                     // Point to previous trunk
                     contents
                         .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);

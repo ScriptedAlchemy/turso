@@ -194,6 +194,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["fts_merge_threshold"],
         ),
+        SecureDelete => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["secure_delete"],
+        ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],

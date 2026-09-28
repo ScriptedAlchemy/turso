@@ -4761,6 +4761,8 @@ impl BTreeCursor {
                                     ..first_child_offset + header_and_pointer_size],
                             );
 
+                        parent_buf[parent_offset + header_and_pointer_size..child_top].fill(0);
+
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
                         turso_assert_less_than!(sibling_count_new, balance_info.sibling_count);
                     }
@@ -9109,6 +9111,7 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         contents.offset(),
         "offset doesn't match computed offset for page"
     );
+    contents.as_ptr()[offset..usable_space].fill(0);
     let id = page_type as u8;
     contents.write_page_type(id);
     contents.write_first_freeblock(0);
@@ -9519,12 +9522,14 @@ fn free_cell_range(
     if unlikely(end > usable_space) {
         return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
     }
+    let freed_range = offset..end;
     let cur_content_area = page.cell_content_area() as usize;
     let first_block = page.first_freeblock() as usize;
     if first_block == 0 {
         if unlikely(offset < cur_content_area) {
             return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
         }
+        page.as_ptr()[freed_range].fill(0);
         if offset == cur_content_area {
             // if the freeblock list is empty and the freed range is exactly at the beginning of the content area,
             // we are not creating a freeblock; instead we are just extending the unallocated region.
@@ -9622,6 +9627,8 @@ fn free_cell_range(
     if unlikely(offset < cur_content_area) {
         return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
     }
+
+    page.as_ptr()[freed_range].fill(0);
 
     // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
     // instead we are just extending the unallocated region.
@@ -9795,6 +9802,8 @@ fn defragment_page_fast(
         }
     }
 
+    page.as_ptr()[page.unallocated_region_start()..new_cell_content_area].fill(0);
+
     // Update page header
     page.write_cell_content_area(new_cell_content_area);
     page.write_first_freeblock(0);
@@ -9834,6 +9843,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 
     let cell_count = page.cell_count();
     if cell_count == 0 {
+        page.as_ptr()[page.unallocated_region_start()..usable_space].fill(0);
         page.write_cell_content_area(usable_space);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
@@ -9913,6 +9923,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             page.write_u16_no_offset(pointer_location, new_offset as u16);
         }
 
+        buffer[first_cell_content_byte..cbrk].fill(0);
         page.write_cell_content_area(cbrk);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
@@ -10722,6 +10733,92 @@ mod tests {
             .unwrap();
 
         (db, temp_dir)
+    }
+
+    fn deleted_payload_absent_after_truncate(mvcc: bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("erase.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+        }
+        conn.execute("PRAGMA secure_delete=ON").unwrap();
+        assert!(conn.execute("PRAGMA secure_delete=OFF").is_err());
+        assert!(conn.execute("PRAGMA secure_delete=FAST").is_err());
+        assert!(conn.execute("PRAGMA secure_delete=2").is_err());
+        conn.execute("CREATE TABLE secrets(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX secrets_body ON secrets(body)")
+            .unwrap();
+        let marker = "ERASE_ME_62d61b4cc9684fbd9c06c59f926930d1_PRIVATE_PAYLOAD";
+        let overflow = marker.repeat(400);
+        conn.execute("INSERT INTO secrets VALUES (1,'keep-before'),(4,'keep-after')")
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO secrets VALUES (2,'{marker}'),(3,'{overflow}')"
+        ))
+        .unwrap();
+        for id in 100..180 {
+            conn.execute(format!(
+                "INSERT INTO secrets VALUES ({id},'{}')",
+                "filler".repeat(40)
+            ))
+            .unwrap();
+        }
+        conn.execute("DELETE FROM secrets WHERE id >= 100").unwrap();
+        let truncate = || {
+            conn.checkpoint(crate::storage::wal::CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        };
+        truncate();
+        let contains_marker = |path: &std::path::Path| {
+            std::fs::read(path)
+                .unwrap()
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        };
+        assert!(
+            contains_marker(&path),
+            "fixture must contain the marker before deletion"
+        );
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM secrets WHERE id IN (2,3)")
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        truncate();
+        assert!(
+            contains_marker(&path),
+            "rollback must preserve the live payload"
+        );
+        conn.execute("DELETE FROM secrets WHERE id IN (2,3)")
+            .unwrap();
+        truncate();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                assert!(
+                    !contains_marker(&path),
+                    "deleted payload survives checkpoint in {}",
+                    path.display()
+                );
+            }
+        }
+        conn.execute("INSERT INTO secrets VALUES (5,'still-usable')")
+            .unwrap();
+    }
+
+    #[test]
+    fn deleted_wal_payload_is_erased_after_truncate() {
+        deleted_payload_absent_after_truncate(false);
+    }
+
+    #[test]
+    fn deleted_mvcc_payload_is_erased_after_truncate() {
+        deleted_payload_absent_after_truncate(true);
     }
 
     /// Deterministic coverage for the allocation-failure window created by routing

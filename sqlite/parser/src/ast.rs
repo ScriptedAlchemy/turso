@@ -1900,6 +1900,7 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    SecureDelete,
     /// Returns information about foreign keys declared by a table
     ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix
