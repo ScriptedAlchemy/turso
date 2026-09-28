@@ -14,7 +14,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::{Schema, Table};
+use crate::schema::{IndexColumn, Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -1083,8 +1083,7 @@ fn query_pragma(
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_identity(program, col, base_reg + 1, base_reg + 2);
                             program.emit_result_row(base_reg, 3);
                         }
                     }
@@ -1130,8 +1129,7 @@ fn query_pragma(
                                 .unwrap_or_else(|| "BINARY".to_string());
 
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_identity(program, col, base_reg + 1, base_reg + 2);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
                             program.emit_int(1, base_reg + 5); // key column
@@ -1824,6 +1822,22 @@ fn query_pragma(
             }
             Ok(TransactionMode::None)
         }
+    }
+}
+
+/// SQLite identifies expression keys by cid -2 and a SQL NULL name.
+fn emit_index_column_identity(
+    program: &mut ProgramBuilder,
+    column: &IndexColumn,
+    cid_register: usize,
+    name_register: usize,
+) {
+    if column.expr.is_some() {
+        program.emit_int(-2, cid_register);
+        program.emit_null(name_register, None);
+    } else {
+        program.emit_int(column.pos_in_table as i64, cid_register);
+        program.emit_string8(column.name.clone(), name_register);
     }
 }
 

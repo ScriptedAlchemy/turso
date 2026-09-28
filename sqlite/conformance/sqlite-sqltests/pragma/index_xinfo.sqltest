@@ -83,3 +83,15 @@ expect {
     0|0|a|0|BINARY|1
     1|-1||0|BINARY|0
 }
+
+@cross-check-integrity
+test pragma-index-xinfo-expression-key-metadata {
+    CREATE TABLE observations(payload TEXT, sequence INTEGER);
+    CREATE INDEX expression_sequence ON observations(lower(payload) COLLATE NOCASE DESC, sequence);
+    SELECT seqno, cid, name IS NULL, coalesce(name, 'expression'), desc, coll, key
+    FROM pragma_index_xinfo('expression_sequence') WHERE key=1 ORDER BY seqno;
+}
+expect {
+    0|-2|1|expression|1|NOCASE|1
+    1|1|0|sequence|0|BINARY|1
+}

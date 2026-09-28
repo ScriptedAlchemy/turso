@@ -66,3 +66,15 @@ test pragma-index-info-function-syntax {
 expect {
     0|0|a
 }
+
+@cross-check-integrity
+test pragma-index-info-expression-key-metadata {
+    CREATE TABLE observations(payload TEXT, sequence INTEGER);
+    CREATE INDEX expression_sequence ON observations(lower(payload), sequence);
+    SELECT seqno, cid, name IS NULL, coalesce(name, 'expression')
+    FROM pragma_index_info('expression_sequence') ORDER BY seqno;
+}
+expect {
+    0|-2|1|expression
+    1|1|0|sequence
+}
