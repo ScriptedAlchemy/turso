@@ -33,7 +33,10 @@ fn expand(
         UserInputAst::Clause(children) => UserInputAst::Clause(
             children
                 .into_iter()
-                .map(|(occur, child)| Ok((occur, expand(child, index, default_fields, boosts)?)))
+                .map(|(occur, child)| {
+                    let child = expand(child, index, default_fields, boosts)?;
+                    Ok((occur, anchor_negative_clause(child)))
+                })
                 .collect::<Result<_, String>>()?,
         ),
         UserInputAst::Boost(child, boost) => UserInputAst::Boost(
@@ -90,4 +93,25 @@ fn expand(
             UserInputAst::Clause(clauses)
         }
     })
+}
+
+fn anchor_negative_clause(ast: UserInputAst) -> UserInputAst {
+    match ast {
+        UserInputAst::Clause(mut children)
+            if !children.is_empty()
+                && children
+                    .iter()
+                    .all(|(occur, _)| *occur == Some(Occur::MustNot)) =>
+        {
+            children.push((
+                Some(Occur::Must),
+                UserInputAst::Leaf(Box::new(UserInputLeaf::All)),
+            ));
+            UserInputAst::Clause(children)
+        }
+        UserInputAst::Boost(child, boost) => {
+            UserInputAst::Boost(Box::new(anchor_negative_clause(*child)), boost)
+        }
+        other => other,
+    }
 }

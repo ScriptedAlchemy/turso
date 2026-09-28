@@ -1240,3 +1240,37 @@ fn fts_query_memory_profile() {
         );
     }
 }
+
+#[test]
+fn boolean_queries_preserve_nested_negation_phrases_and_disjunction() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[(1, "quick brown fox"), (2, "quick fox"), (3, "brown bear")],
+    );
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment];
+    cursor.ensure_searcher().unwrap();
+    for (query, expected) in [
+        ("\"quick\" AND \"brown\"", vec![1]),
+        ("\"quick brown\"", vec![1]),
+        ("quick OR bear", vec![1, 2, 3]),
+        ("quick NOT brown", vec![2]),
+        ("\"quick\" AND NOT \"brown\"", vec![2]),
+        ("NOT brown AND quick", vec![2]),
+        ("quick AND NOT (brown OR bear)", vec![2]),
+        ("bear OR NOT brown", vec![2, 3]),
+        ("quick AND NOT \"brown fox\"", vec![2]),
+        ("quick AND NOT (NOT brown)", vec![1]),
+        ("qui* AND NOT brow*", vec![2]),
+    ] {
+        for pattern in [FTS_PATTERN_MATCH, FTS_PATTERN_COMBINED] {
+            let mut ids = query_hits(&mut cursor, pattern, query, -1)
+                .into_iter()
+                .map(|hit| hit.0)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, expected, "{query}");
+        }
+    }
+}

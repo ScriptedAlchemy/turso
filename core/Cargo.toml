@@ -85,7 +85,7 @@ libc = { version = "0.2.172" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
-tantivy = { version = "0.26.2", optional = true }
+tantivy = { git = "https://github.com/ScriptedAlchemy/tantivy", rev = "2e6e98df87c29219d06980c7a2eab3b5b0d10cd6", optional = true }
 memmap2 = { version = "0.9", optional = true, features = ["stable_deref_trait"] }
 crc32fast = { version = "1", optional = true }
 
