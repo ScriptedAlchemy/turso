@@ -264,6 +264,7 @@ pub fn translate_pragma(
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
             | PragmaName::ForeignKeyList
+            | PragmaName::ForeignKeyCheck
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -619,6 +620,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyCheck => unreachable!("foreign_key_check cannot be set"),
         PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
@@ -1220,6 +1222,21 @@ fn query_pragma(
                 program.add_pragma_result_column(col_name.to_string());
             }
             Ok(TransactionMode::None)
+        }
+        PragmaName::ForeignKeyCheck => {
+            let table_name = match value {
+                Some(Expr::Name(name)) => Some(name.as_str().to_owned()),
+                None => None,
+                _ => bail_parse_error!("foreign_key_check expects a table name"),
+            };
+            super::foreign_key_check::translate_foreign_key_check(
+                resolver,
+                database_id,
+                table_name.as_deref(),
+                program,
+                &connection,
+            )?;
+            Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
             let table_name = match value {

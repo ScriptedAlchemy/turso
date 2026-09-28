@@ -4441,3 +4441,51 @@ test fk-hidden-rowid-is-not-a-parent-key {
 }
 expect error {
 }
+
+@cross-check-integrity
+test fk-audit-composite-parent-affinity-and-null {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(a INTEGER, b TEXT COLLATE NOCASE, PRIMARY KEY(a,b));
+    CREATE TABLE child(a TEXT, b TEXT, FOREIGN KEY(a,b) REFERENCES parent(a,b));
+    INSERT INTO parent VALUES (1,'Key');
+    INSERT INTO child VALUES ('01','key'), ('2','missing'), (NULL,'missing'), ('2',NULL);
+    SELECT "table", rowid, parent, fkid FROM pragma_foreign_key_check('child');
+}
+expect {
+    child|2|parent|0
+}
+
+@cross-check-integrity
+test fk-audit-missing-parent-global {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE child(value REFERENCES missing(id));
+    INSERT INTO child VALUES (1), (NULL);
+    SELECT "table", rowid, parent, fkid FROM pragma_foreign_key_check;
+}
+expect {
+    child|1|missing|0
+}
+
+@cross-check-integrity
+test fk-audit-pragma-and-declared-rowid {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(rowid INTEGER PRIMARY KEY);
+    CREATE TABLE child(value REFERENCES parent(rowid));
+    INSERT INTO child VALUES (7);
+    PRAGMA foreign_key_check(child);
+}
+expect {
+    child|1|parent|0
+}
+
+@cross-check-integrity
+test fk-audit-shadowed-rowid-returns-physical-rowid {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(rowid TEXT, _rowid_ TEXT, oid TEXT, value REFERENCES parent(id));
+    INSERT INTO child VALUES ('a','b','c',9);
+    SELECT rowid FROM pragma_foreign_key_check('child');
+}
+expect {
+    1
+}

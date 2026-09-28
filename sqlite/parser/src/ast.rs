@@ -1903,6 +1903,8 @@ pub enum PragmaName {
     SecureDelete,
     /// Returns information about foreign keys declared by a table
     ForeignKeyList,
+    /// Reports rows violating declared foreign keys.
+    ForeignKeyCheck,
     /// Deprecated: control whether column names include table name prefix
     FullColumnNames,
     /// List all SQL functions known to the database connection
