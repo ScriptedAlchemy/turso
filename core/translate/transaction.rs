@@ -62,15 +62,15 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
-            // Temp has no MVCC, so it uses a plain write lock even in
-            // Concurrent mode. The op_transaction handler detects this via
-            // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-            program.emit_insn(Insn::Transaction {
-                db: crate::TEMP_DB_ID,
-                tx_mode: TransactionMode::Write,
-                schema_cookie: temp_schema_cookie,
-            });
+            if resolver.has_temp_database() {
+                let temp_schema_cookie =
+                    resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+                program.emit_insn(Insn::Transaction {
+                    db: crate::TEMP_DB_ID,
+                    tx_mode: TransactionMode::Write,
+                    schema_cookie: temp_schema_cookie,
+                });
+            }
             for db_id in resolver.attached_database_ids_in_search_order()? {
                 let cookie = resolver.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {

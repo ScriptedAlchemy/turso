@@ -19593,6 +19593,65 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
 }
 
 #[test]
+fn concurrent_main_writes_leave_temp_database_unopened() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    db.connect()
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn = db.connect();
+    conn.set_temp_store(crate::TempStore::File);
+    assert!(conn.temp.database.read().is_none());
+    for id in 1..=3 {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({id})"))
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert!(conn.temp.database.read().is_none());
+    }
+    assert_eq!(get_rows(&conn, "SELECT id FROM t").len(), 3);
+}
+
+#[test]
+fn concurrent_transaction_lazily_enlists_temp_with_rollback_and_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    db.connect()
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn = db.connect();
+    conn.set_temp_store(crate::TempStore::File);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert!(conn.temp.database.read().is_none());
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO scratch VALUES (1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert!(conn.prepare("SELECT * FROM scratch").is_err());
+    assert!(get_rows(&conn, "SELECT id FROM t").is_empty());
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO scratch VALUES (2)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM scratch")[0][0].to_string(),
+        "2"
+    );
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE scratch SET id = 3").unwrap();
+    conn.execute("UPDATE t SET id = 3").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM scratch")[0][0].to_string(),
+        "2"
+    );
+    assert_eq!(get_rows(&conn, "SELECT id FROM t")[0][0].to_string(), "2");
+}
+
+#[test]
 fn dropped_main_commit_rolls_back_temp_schema_changes() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
