@@ -72,3 +72,47 @@ test strict-not-null-still-enforced {
 }
 expect error {
 }
+
+@cross-check-integrity
+test strict-primary-key-implicit-not-null-metadata {
+    CREATE TABLE text_key(k TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE composite_key(a INTEGER, b TEXT, PRIMARY KEY(a,b)) STRICT;
+    CREATE TABLE rowid_key(k INTEGER PRIMARY KEY) STRICT;
+    SELECT name, "notnull", pk FROM pragma_table_xinfo('text_key');
+    SELECT name, "notnull", pk FROM pragma_table_xinfo('composite_key');
+    SELECT name, "notnull", pk FROM pragma_table_xinfo('rowid_key');
+    INSERT INTO rowid_key VALUES (NULL);
+    SELECT k FROM rowid_key;
+}
+expect {
+    k|1|1
+    a|1|1
+    b|1|2
+    k|0|1
+    1
+}
+
+@cross-check-integrity
+test strict-primary-key-text-rejects-null {
+    CREATE TABLE text_key(k TEXT PRIMARY KEY) STRICT;
+    INSERT INTO text_key VALUES (NULL);
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-primary-key-composite-rejects-null {
+    CREATE TABLE composite_key(a INTEGER, b TEXT, PRIMARY KEY(a,b)) STRICT;
+    INSERT INTO composite_key VALUES (NULL, 'key');
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-primary-key-update-rejects-null {
+    CREATE TABLE composite_key(a INTEGER, b TEXT, PRIMARY KEY(a,b)) STRICT;
+    INSERT INTO composite_key VALUES (1, 'key');
+    UPDATE composite_key SET b=NULL;
+}
+expect error {
+}

@@ -5039,10 +5039,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
-    if !table.has_rowid {
-        if table.primary_key_columns.is_empty() {
-            crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
-        }
+    if !table.has_rowid && table.primary_key_columns.is_empty() {
+        crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
+    }
+    if !table.has_rowid || table.is_strict {
         for (pk_name, _) in &table.primary_key_columns {
             let Some((_, col)) = table.get_column(pk_name) else {
                 crate::bail_parse_error!(
@@ -5050,6 +5050,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     table.name
                 );
             };
+            // NULL still allocates an INTEGER PRIMARY KEY rowid in STRICT
+            // tables. Other STRICT primary-key columns are implicitly NOT NULL.
+            if col.is_rowid_alias() {
+                continue;
+            }
             if !col.notnull() {
                 let Some(idx) = table.get_column(pk_name).map(|(idx, _)| idx) else {
                     unreachable!("PRIMARY KEY column should exist");
