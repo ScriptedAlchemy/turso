@@ -379,8 +379,10 @@ fn estimate_selectivity(
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
-            let is_pk_or_rowid_alias =
-                is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            // Membership in a composite primary key does not make this
+            // column unique. Only rowid aliases or a single-column unique
+            // index below justify the one-row estimate for one constraint.
+            let is_rowid_alias = is_rowid || column.is_some_and(Column::is_rowid_alias);
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64
@@ -389,7 +391,7 @@ fn estimate_selectivity(
                 1.0 / params.rows_per_table_fallback
             };
 
-            if is_pk_or_rowid_alias {
+            if is_rowid_alias {
                 selectivity_when_unique
             } else if let Some(index) = index {
                 // Only use unique selectivity for single-column unique indexes.

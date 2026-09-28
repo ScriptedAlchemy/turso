@@ -2214,7 +2214,7 @@ impl Pager {
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
-            let buffer = self.buffer_pool.allocate(page_size + 4);
+            let buffer = self.buffer_pool.allocate(page_size + 4)?;
             let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
@@ -2529,7 +2529,7 @@ impl Pager {
         let mut dirty_pages = self.dirty_pages.write();
 
         while current_offset < journal_end_offset {
-            let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
+            let page_id_buffer = Arc::new(self.buffer_pool.allocate(4)?);
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
@@ -2544,7 +2544,7 @@ impl Pager {
                 continue;
             }
 
-            let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize));
+            let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize)?);
             let page = Arc::new(Page::new(page_id as i64));
             let c = subjournal.read_page(
                 current_offset,
@@ -3099,7 +3099,7 @@ impl Pager {
         let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
         {
             let inner = page.get();
-            inner.set_buffer(Arc::new(Buffer::new_temporary(size.get() as usize)));
+            inner.set_buffer(Arc::new(self.buffer_pool.allocate(size.get() as usize)?));
         }
 
         page.get_contents().write_database_header(&header);
@@ -5676,7 +5676,7 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool);
+                let page = allocate_new_page(1, &self.buffer_pool)?;
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -5807,7 +5807,8 @@ impl Pager {
                                 cache.contains_key(&page_key)
                             };
                             if !already_present {
-                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                let page =
+                                    allocate_new_page(new_db_size as i64, &self.buffer_pool)?;
                                 self.add_dirty(&page)?;
                                 self.page_cache.write().force_insert_page(page_key, page)?;
                             }
@@ -5969,7 +5970,7 @@ impl Pager {
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            allocate_new_page(new_db_size as i64, &self.buffer_pool)?;
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
                         self.page_cache
@@ -5986,7 +5987,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool)?;
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
@@ -6237,16 +6238,16 @@ impl Pager {
     }
 }
 
-pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef {
+pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> Result<PageRef> {
     let page = Arc::new(Page::new(page_id));
     {
-        let buffer = buffer_pool.get_page();
+        let buffer = buffer_pool.get_page()?;
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
         page.set_loaded();
         page.clear_wal_tag();
     }
-    page
+    Ok(page)
 }
 
 pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {

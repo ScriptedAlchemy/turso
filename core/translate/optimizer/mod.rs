@@ -24,6 +24,7 @@ use crate::{
     translate::{
         expr::{
             expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+            walk_expr_mut, WalkControl,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -197,6 +198,8 @@ pub struct IndexMethodCandidate {
     pub arguments: Vec<ast::Expr>,
     /// Mapping from synthetic column IDs to pattern column IDs for covered columns
     pub covered_columns: HashMap<usize, usize>,
+    /// Bound output expressions needed when this candidate wins join planning.
+    pub covered_expressions: Vec<(ast::Expr, usize)>,
     /// Index in WHERE clause that was covered by this pattern (if any)
     pub where_covered: Option<usize>,
     /// Cost estimate from the index method
@@ -211,6 +214,7 @@ impl IndexMethodCandidate {
             pattern_idx: self.pattern_idx,
             arguments: self.arguments.clone(),
             covered_columns: self.covered_columns.clone(),
+            covered_expressions: self.covered_expressions.clone(),
         }
     }
 }
@@ -274,6 +278,7 @@ pub(crate) fn plan_index_method_predicate<'a>(
                         pattern_idx,
                         arguments: sorted_arguments_from_parameters(&matched.parameters),
                         covered_columns: HashMap::default(),
+                        covered_expressions: Vec::new(),
                     },
                 ));
             }
@@ -473,24 +478,26 @@ fn try_match_index_method_pattern(
 }
 
 /// Build covered columns mapping from pattern columns.
-/// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
+/// Retain bound expressions so either planning path can rewrite nested uses.
 fn build_covered_columns_mapping(
     pattern_columns: &[ast::ResultColumn],
     parameters: &HashMap<i32, ast::Expr>,
-) -> HashMap<usize, usize> {
+) -> (HashMap<usize, usize>, Vec<(ast::Expr, usize)>) {
     let mut covered_column_id = 1_000_000;
     let mut covered_columns = HashMap::default();
+    let mut covered_expressions = Vec::new();
     for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
         };
-        let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
+        let Some(substituted) = try_substitute_parameters(pattern_expr, parameters) else {
             continue;
         };
         covered_columns.insert(covered_column_id, pattern_column_id);
+        covered_expressions.push((*substituted, covered_column_id));
         covered_column_id += 1;
     }
-    covered_columns
+    (covered_columns, covered_expressions)
 }
 
 /// Sort parameters by key and extract just the expressions as a Vec.
@@ -557,7 +564,7 @@ fn collect_index_method_candidates(
                 };
 
                 // Build covered columns mapping from pattern match
-                let covered_columns = build_covered_columns_mapping(
+                let (covered_columns, covered_expressions) = build_covered_columns_mapping(
                     &pattern_match.pattern_columns,
                     &pattern_match.parameters,
                 );
@@ -585,6 +592,7 @@ fn collect_index_method_candidates(
                     pattern_idx: pattern_match.pattern_idx,
                     arguments,
                     covered_columns,
+                    covered_expressions,
                     where_covered: pattern_match.where_covered,
                     cost_estimate,
                 });
@@ -1270,6 +1278,12 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    rewrite_index_method_outputs(
+        &mut plan.result_columns,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &plan.table_references,
+    )?;
     Ok(())
 }
 
@@ -1954,36 +1968,10 @@ fn optimize_table_access_with_custom_modules(
                 where_query[where_covered].consumed = true;
             }
 
-            // Build covered columns mapping and update result_columns.
-            // This differs from collect_index_method_candidates: we modify result_columns
-            // and increment covered_column_id per matching query column, not per pattern column.
-            let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::default();
-            for (pattern_column_id, pattern_column) in
-                pattern_match.pattern_columns.iter().enumerate()
-            {
-                let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
-                    continue;
-                };
-                let Some(substituted) =
-                    try_substitute_parameters(pattern_expr, &pattern_match.parameters)
-                else {
-                    continue;
-                };
-                for query_column in result_columns.iter_mut() {
-                    if !exprs_are_equivalent(&query_column.expr, &substituted) {
-                        continue;
-                    }
-                    query_column.expr = ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: covered_column_id,
-                        is_rowid_alias: false,
-                    };
-                    covered_columns.insert(covered_column_id, pattern_column_id);
-                    covered_column_id += 1;
-                }
-            }
+            let (covered_columns, covered_expressions) = build_covered_columns_mapping(
+                &pattern_match.pattern_columns,
+                &pattern_match.parameters,
+            );
 
             // Calculate whether WHERE is completely covered for ORDER BY/LIMIT clearing
             let where_covered_completely = where_query.is_empty()
@@ -2009,12 +1997,58 @@ fn optimize_table_access_with_custom_modules(
                     index: index.clone(),
                     pattern_idx: pattern_match.pattern_idx,
                     covered_columns,
+                    covered_expressions,
                     arguments,
                 });
+            rewrite_index_method_outputs(result_columns, where_query, order_by, table_references)?;
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Replace covered subexpressions only after the winning access method is known.
+/// Both projection wrappers and residual ordering/filtering must read the index
+/// output rather than execute the scalar fallback for the same function.
+fn rewrite_index_method_outputs(
+    result_columns: &mut [ResultSetColumn],
+    where_clause: &mut [WhereTerm],
+    order_by: &mut [(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
+    table_references: &TableReferences,
+) -> Result<()> {
+    for table in table_references.joined_tables() {
+        let Operation::IndexMethodQuery(query) = &table.op else {
+            continue;
+        };
+        let mut replace = |expr: &mut Expr| -> Result<WalkControl> {
+            for (covered, column) in &query.covered_expressions {
+                if exprs_are_equivalent(expr, covered) {
+                    *expr = ast::Expr::Column {
+                        database: None,
+                        table: table.internal_id,
+                        column: *column,
+                        is_rowid_alias: false,
+                    };
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        };
+        for column in result_columns.iter_mut() {
+            walk_expr_mut(&mut column.expr, &mut replace)?;
+        }
+        for (expr, _, _) in order_by.iter_mut() {
+            walk_expr_mut(expr, &mut replace)?;
+        }
+        for term in where_clause.iter_mut().filter(|term| !term.consumed) {
+            walk_expr_mut(&mut term.expr, &mut replace)?;
+        }
+    }
+    Ok(())
 }
 
 /// We do a single pass over projected, grouping, filtering, and ordering expressions to

@@ -7,8 +7,105 @@ use crate::{
     schema::IndexColumn,
 };
 use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
+
+#[test]
+fn unicode_tokenizer_preserves_long_tokens_and_folds_case_and_accents() {
+    for mvcc in [false, true] {
+        let db = crate::Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+                .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX docs_fts ON docs USING fts(title, body) WITH (tokenizer = 'unicode')",
+        )
+        .unwrap();
+        let token = "LongIdentifier".repeat(8);
+        conn.execute(format!("INSERT INTO docs VALUES (1, 'Résumé', 'CAFÉ quick fox {token}'), (2, 'cafe', 'unrelated')"))
+            .unwrap();
+        for query in [
+            token.to_lowercase(),
+            format!("{}*", token[..60].to_lowercase()),
+            "body:cafe".to_string(),
+            "title:resume".to_string(),
+            "body:\"QUICK FOX\"".to_string(),
+        ] {
+            let rows = conn
+                .prepare(format!(
+                    "SELECT id FROM docs WHERE fts_match(title, body, '{query}') ORDER BY id"
+                ))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::from_i64(1)]], "{query}, mvcc={mvcc}");
+        }
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE docs SET body = 'changed' WHERE id = 1")
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        let rows = conn
+            .prepare("SELECT id FROM docs WHERE fts_match(title, body, 'body:cafe')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+        conn.execute("DELETE FROM docs WHERE id = 1").unwrap();
+        let rows = conn
+            .prepare("SELECT id FROM docs WHERE fts_match(title, body, 'body:cafe')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+}
+
+#[test]
+fn fts_score_survives_joins_and_negation() {
+    let db = crate::Database::open(
+        Arc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES(1, 'relevant text')")
+        .unwrap();
+    for sql in [
+        "SELECT fts_score(body, 'relevant') AS rank FROM docs WHERE fts_match(body, 'relevant') ORDER BY rank DESC",
+        "SELECT fts_score(d.body, 'relevant') AS rank FROM docs d JOIN docs other ON other.id = d.id WHERE fts_match(d.body, 'relevant') ORDER BY rank DESC",
+        "SELECT -fts_score(body, 'relevant') AS rank FROM docs WHERE fts_match(body, 'relevant') ORDER BY rank",
+        "SELECT -fts_score(d.body, 'relevant') AS rank FROM docs d JOIN docs other ON other.id = d.id WHERE fts_match(d.body, 'relevant') ORDER BY rank",
+        "SELECT -fts_score(body, 'relevant') AS rank FROM docs WHERE fts_match(body, 'relevant') AND fts_score(body, 'relevant') > 0 ORDER BY rank",
+        "SELECT -fts_score(d.body, 'relevant') AS rank FROM docs d JOIN docs other ON other.id = d.id WHERE fts_match(d.body, 'relevant') AND fts_score(d.body, 'relevant') > 0 ORDER BY rank",
+    ] {
+        let scores = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(scores.len(), 1);
+        let expected_negative = sql.starts_with("SELECT -");
+        let score = scores[0][0].as_float();
+        assert!(score.is_finite() && score != 0.0, "{sql}: {scores:?}");
+        assert_eq!(score < 0.0, expected_negative, "{sql}: {scores:?}");
+    }
+}
 
 #[test]
 fn field_weights_reject_non_finite_and_non_positive_values() {
@@ -156,32 +253,22 @@ fn fts_cost_estimate_applies_literal_limit_to_output_rows() {
 }
 
 #[test]
-fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
-    let path = std::path::Path::new("x.term");
-    let mut chunks: HashMap<i64, Vec<u8>> = HashMap::default();
-    chunks.insert(0, vec![1, 2, 3]);
-    chunks.insert(1, vec![4, 5]);
-    assert_eq!(
-        &*assemble_chunks(path, chunks.clone()).unwrap(),
-        &[1, 2, 3, 4, 5]
-    );
-
-    // A negative chunk number next to valid ones: it is counted but never
-    // written, so assembly must error rather than hand out uninitialized
-    // bytes or trip an assert.
-    chunks.insert(-1, vec![9]);
-    assert!(matches!(
-        assemble_chunks(path, chunks.clone()),
-        Err(LimboError::Corrupt(_))
-    ));
-
-    // A hole is reported as the missing chunk.
-    chunks.remove(&-1);
-    chunks.remove(&0);
-    assert!(matches!(
-        assemble_chunks(path, chunks),
-        Err(LimboError::Corrupt(_))
-    ));
+fn staged_chunks_reject_missing_or_duplicate_numbers_and_share_mapped_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut file = StagedFile::new(directory.path()).unwrap();
+    assert!(matches!(file.append(-1, &[9]), Err(LimboError::Corrupt(_))));
+    assert!(matches!(file.append(1, &[9]), Err(LimboError::Corrupt(_))));
+    file.append(0, &[1, 2, 3]).unwrap();
+    assert!(matches!(file.append(0, &[9]), Err(LimboError::Corrupt(_))));
+    file.append(1, &[4, 5]).unwrap();
+    let mapped = file.finish().unwrap();
+    assert_eq!(&*mapped, &[1, 2, 3, 4, 5]);
+    let tail = mapped.slice(3..5);
+    assert_eq!(tail.as_ptr(), mapped[3..].as_ptr());
+    drop(mapped);
+    assert_eq!(&*tail, &[4, 5]);
+    drop(tail);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -228,9 +315,10 @@ fn segment_build_round_trips_through_synthesized_snapshot() {
         .filter(|row| row.path.starts_with(FTS2_SEGMENT_PREFIX))
         .count();
     assert_eq!(descriptor_rows, 1);
-    assert!(rows
-        .iter()
-        .all(|row| row.path.starts_with(FTS2_PATH_PREFIX)));
+    assert!(
+        rows.iter()
+            .all(|row| row.path.starts_with(FTS2_PATH_PREFIX))
+    );
 
     // Reopen through a snapshot view and query it.
     let mut cursor = FtsCursor::new(&attachment);
@@ -257,17 +345,19 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
     assert_ne!(segment.id(), minted);
 
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, OwnedBytes> = segment
         .data
         .files
         .iter()
-        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
         .collect();
     let renamed = rename_segment_files(files.clone(), &segment.id(), &minted).unwrap();
     assert_eq!(renamed.len(), files.len());
-    assert!(renamed
-        .keys()
-        .all(|path| path.to_str().unwrap().starts_with(&minted.uuid_string())));
+    assert!(
+        renamed
+            .keys()
+            .all(|path| path.to_str().unwrap().starts_with(&minted.uuid_string()))
+    );
 
     // The renamed files open and answer queries under the new id: the
     // bytes never embed the segment id.
@@ -276,6 +366,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
         segment.descriptor.max_doc,
         renamed,
         segment.data.identities.clone(),
+        std::path::Path::new("."),
     )
     .unwrap();
     let rekeyed = rekeyed.expect("non-empty segment");
@@ -298,7 +389,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     // A file that is not named after the source segment is a bug, not
     // something to rename silently.
     let mut stray = files;
-    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    stray.insert(PathBuf::from("meta.json"), OwnedBytes::empty());
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
         Err(LimboError::InternalError(_))
@@ -314,7 +405,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     );
 
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![segment.clone()];
+    cursor.segments = vec![segment.try_clone().unwrap()];
     cursor.snapshot_loaded = true;
     let postings = cursor.live_postings_for_rowid(2).unwrap();
     assert_eq!(postings.len(), 1);
@@ -323,7 +414,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
 
     // Tombstone rowid 2 and rebuild the view: the posting must disappear
     // from every query path, including counts.
-    segment.deleted.insert(doc_id);
+    segment.deleted.insert(doc_id).unwrap();
     let mut cursor = FtsCursor::new(&attachment);
     cursor.segments = vec![segment];
     cursor.snapshot_loaded = true;
@@ -355,7 +446,7 @@ fn rowid_lookup_uses_current_deletes_with_reordered_segments() {
         .into_iter()
         .collect();
     assert_eq!(hits, HashSet::from_iter([(first_id, 0), (second_id, 1)]));
-    cursor.segments[0].deleted.insert(1);
+    cursor.segments[0].deleted.insert(1).unwrap();
     assert_eq!(
         cursor.live_postings_for_rowid(7).unwrap(),
         vec![(first_id, 0)]
@@ -378,9 +469,11 @@ fn segment_load_reads_the_identities_the_build_wrote() {
     );
     let written = identities_of(&segment);
     assert_eq!(written.len(), 3);
-    assert!(written
-        .iter()
-        .all(|identity| identity.raw() > u128::from(u64::MAX)));
+    assert!(
+        written
+            .iter()
+            .all(|identity| identity.raw() > u128::from(u64::MAX))
+    );
     assert!(
         written.windows(2).all(|pair| pair[0] != pair[1]),
         "every document gets its own identity"
@@ -388,11 +481,11 @@ fn segment_load_reads_the_identities_the_build_wrote() {
 
     // A segment loaded from storage reads its identities from the fast
     // field. A merged segment and every cache miss do the same.
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, OwnedBytes> = segment
         .data
         .files
         .iter()
-        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
         .collect();
     let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
     let read_back = read_segment_identities(
@@ -403,7 +496,12 @@ fn segment_load_reads_the_identities_the_build_wrote() {
         files,
     )
     .unwrap();
-    assert_eq!(read_back, segment.data.identities);
+    for position in 0..segment.descriptor.max_doc {
+        assert_eq!(
+            read_back.identity_of(position),
+            segment.data.identities.identity_of(position)
+        );
+    }
 
     let mut cursor = FtsCursor::new(&attachment);
     cursor.segments = vec![segment];
@@ -477,13 +575,13 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
     let second_ids = identities_of(&second);
 
     // Delete rowids 2 and 3: one document in each input segment.
-    first.deleted.insert(1);
-    second.deleted.insert(0);
+    first.deleted.insert(1).unwrap();
+    second.deleted.insert(0).unwrap();
     let dropped = [first_ids[1], second_ids[0]];
     let kept = [first_ids[0], second_ids[1]];
 
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![first.clone(), second.clone()];
+    cursor.segments = vec![first.try_clone().unwrap(), second.try_clone().unwrap()];
     cursor.snapshot_loaded = true;
     let candidates: HashSet<SegmentId> = [first.id(), second.id()].into_iter().collect();
     cursor.stage_merge_of_segments(&candidates).unwrap();
@@ -502,7 +600,7 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
     );
 
     // The rowid of each survivor still maps to its original identity.
-    cursor.segments = vec![merged.clone()];
+    cursor.segments = vec![merged.try_clone().unwrap()];
     cursor.invalidate_snapshot_view();
     for (rowid, identity) in [(1, kept[0]), (4, kept[1])] {
         let postings = cursor.live_postings_for_rowid(rowid).unwrap();
@@ -518,7 +616,8 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
         merged
             .data
             .identities
-            .tombstoned_positions(&HashSet::from_iter([kept[1]]))
+            .tombstoned_positions(std::iter::once(kept[1]), std::path::Path::new("."))
+            .unwrap()
             .len(),
         1
     );
@@ -556,43 +655,69 @@ fn snapshots_with_different_segment_sets_do_not_share_searchers() {
     let (segment_a, _) = build_and_load_segment(&attachment, &[(1, "alpha")]);
     let (segment_b, _) = build_and_load_segment(&attachment, &[(2, "beta")]);
 
-    let key_a = searcher_key(std::slice::from_ref(&segment_a));
-    let key_ab = searcher_key(&[segment_a.clone(), segment_b]);
+    let key_a = searcher_key(std::slice::from_ref(&segment_a)).unwrap();
+    let key_ab = searcher_key(&[segment_a.try_clone().unwrap(), segment_b]).unwrap();
     assert_ne!(key_a, key_ab);
 
     // Tombstone state is part of the identity.
-    let mut tombstoned = segment_a.clone();
-    tombstoned.deleted.insert(0);
+    let mut tombstoned = segment_a.try_clone().unwrap();
+    tombstoned.deleted.insert(0).unwrap();
     assert_ne!(
-        searcher_key(std::slice::from_ref(&segment_a)),
-        searcher_key(std::slice::from_ref(&tombstoned))
+        searcher_key(std::slice::from_ref(&segment_a)).unwrap(),
+        searcher_key(std::slice::from_ref(&tombstoned)).unwrap()
     );
 }
 
 #[test]
-fn segment_byte_cache_keeps_newest_and_respects_budget() {
-    let mut cache = SegmentByteCache::default();
+fn segment_byte_cache_bounds_retention_reuses_mappings_and_preserves_active_pins() {
+    let (segment, _) = build_and_load_segment(&test_attachment(), &[(1, "sample")]);
+    let identities = segment.data.identities.clone();
+    let directory = tempfile::tempdir().unwrap();
     let make_data = |bytes: usize| {
+        let mut staged = StagedFile::new(directory.path()).unwrap();
+        staged.append(0, &vec![7u8; bytes]).unwrap();
         let mut files = HashMap::default();
-        files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
-        Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
+        files.insert("f".to_string(), staged.finish().unwrap());
+        Arc::new(SegmentData::new(files, identities.clone()))
     };
+    let mut cache = SegmentByteCache::default();
     let a = SegmentId::generate_random();
     let b = SegmentId::generate_random();
     let c = SegmentId::generate_random();
-    cache.put(a, make_data(100), 250);
-    cache.put(b, make_data(100), 250);
+    let active = cache.put(a, make_data(100), 250);
+    let active_weak = Arc::downgrade(&active);
+    let retained = cache.put(b, make_data(100), 250);
+    let retained_weak = Arc::downgrade(&retained);
+    drop(retained);
     cache.put(c, make_data(100), 250);
-    assert!(cache.get(&a).is_none(), "oldest entry evicted over budget");
+    assert_eq!(cache.total_bytes(), 200);
+    assert!(cache.get(&a).is_none());
+    assert_eq!(&active.files["f"][..], &[7u8; 100]);
+    assert!(
+        active_weak.upgrade().is_some(),
+        "active pin outlives eviction"
+    );
+
+    let duplicate = make_data(100);
+    let duplicate_weak = Arc::downgrade(&duplicate);
+    let canonical = cache.put(b, duplicate, 250);
+    assert!(Arc::ptr_eq(&canonical, &retained_weak.upgrade().unwrap()));
+    assert!(duplicate_weak.upgrade().is_none());
+    drop(canonical);
+
+    let oversized = cache.put(a, make_data(1000), 250);
+    assert!(cache.get(&a).is_none());
+    assert_eq!(cache.total_bytes(), 200);
+    assert_eq!(oversized.files["f"].len(), 1000);
+    drop(oversized);
     assert!(cache.get(&b).is_some());
     assert!(cache.get(&c).is_some());
-
-    // An entry larger than the whole budget is still kept (it is the
-    // newest); older entries are evicted to make room.
-    cache.put(a, make_data(1000), 250);
-    assert!(cache.get(&a).is_some());
-    assert!(cache.get(&b).is_none());
-    assert!(cache.get(&c).is_none());
+    drop(cache);
+    assert!(retained_weak.upgrade().is_none());
+    assert!(active_weak.upgrade().is_some());
+    drop(active);
+    assert!(active_weak.upgrade().is_none());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -605,7 +730,7 @@ fn query_rowid_readers_follow_cached_searcher_order_and_snapshot() {
     let (second, _) =
         build_and_load_segment(&attachment, &[(400, "beta alpha"), (13, "beta delta")]);
     let mut original = FtsCursor::new(&attachment);
-    original.segments = vec![first.clone(), second.clone()];
+    original.segments = vec![first.try_clone().unwrap(), second.try_clone().unwrap()];
     original.ensure_searcher().unwrap();
 
     let mut cached = FtsCursor::new(&attachment);
@@ -648,7 +773,7 @@ fn query_rowid_readers_follow_cached_searcher_order_and_snapshot() {
         ranked[..2]
     );
 
-    cached.segments[1].deleted.insert(0);
+    cached.segments[1].deleted.insert(0).unwrap();
     cached.invalidate_snapshot_view();
     assert!(cached.rowid_readers.is_empty());
     let deleted = query_hits(&mut cached, FTS_PATTERN_COMBINED_ORDERED_LIMIT, "alpha", 1);
@@ -704,8 +829,8 @@ fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
 #[cfg(nightly)]
 mod allocation_failures {
     use super::*;
-    use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
     use crate::DatabaseAllocators;
+    use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
     use std::io::{ErrorKind, Write};
     use std::ptr::NonNull;
     use std::sync::atomic::AtomicIsize;
@@ -904,5 +1029,214 @@ mod allocation_failures {
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             unsafe { Global.deallocate(ptr, layout) }
         }
+    }
+}
+
+#[test]
+fn prefix_queries_preserve_boolean_fields_unicode_and_long_tokens() {
+    for mvcc in [false, true] {
+        let db = crate::Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+                .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX docs_fts ON docs USING fts(title, body) WITH (tokenizer = 'unicode')",
+        )
+        .unwrap();
+        let long = "LongIdentifier".repeat(8);
+        conn.execute(format!("INSERT INTO docs VALUES (1, 'Résumé', 'CAFÉ quick fox zebra {long}'), (2, 'cafe', 'quick food'), (3, 'unrelated', 'quicker forest')")).unwrap();
+        for (query, expected) in [
+            ("quick*".to_owned(), vec![1, 2, 3]),
+            ("\"quick\"*".to_owned(), vec![1, 2, 3]),
+            ("quick".to_owned(), vec![1, 2]),
+            ("body:\"CAF\"*".to_owned(), vec![1]),
+            ("title:\"RÉSU\"*".to_owned(), vec![1]),
+            ("\"z\"*".to_owned(), vec![1]),
+            (format!("\"{}\"*", &long[..60]), vec![1]),
+            ("\"quick\"* AND \"fox\"*".to_owned(), vec![1]),
+            ("\"quick\"* NOT \"food\"*".to_owned(), vec![1, 3]),
+            ("body:\"quick fo\"*".to_owned(), vec![1, 2]),
+            ("title:\"quick\"*".to_owned(), vec![]),
+            ("\"absent\"* OR \"fox\"*".to_owned(), vec![1]),
+        ] {
+            let rows = conn
+                .prepare(format!(
+                    "SELECT id FROM docs WHERE fts_match(title, body, '{query}') ORDER BY id"
+                ))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|id| vec![Value::from_i64(id)])
+                .collect();
+            assert_eq!(rows, expected, "{query}, mvcc={mvcc}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "isolated cold-process FTS memory and concurrency measurement"]
+fn fts_query_memory_profile() {
+    const TEST: &str = "index_method::fts::tests::fts_query_memory_profile";
+    const PATH_ENV: &str = "TURSO_FTS_PROFILE_FIXTURE";
+    const CLIENTS_ENV: &str = "TURSO_FTS_PROFILE_CLIENTS";
+    fn memory(stage: &str) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let fields: Vec<_> = status
+            .lines()
+            .filter(|line| {
+                ["VmHWM:", "VmRSS:", "RssAnon:", "RssFile:"]
+                    .iter()
+                    .any(|key| line.starts_with(key))
+            })
+            .collect();
+        println!("FTS_MEMORY {stage} {}", fields.join(" "));
+        if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
+            let io: Vec<_> = io
+                .lines()
+                .filter(|line| line.starts_with("read_bytes:") || line.starts_with("write_bytes:"))
+                .collect();
+            println!("FTS_IO {stage} {}", io.join(" "));
+        }
+        if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
+            if let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) {
+                let root =
+                    std::path::Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+                if let Ok(bytes) = std::fs::read_to_string(root.join("memory.current")) {
+                    println!(
+                        "FTS_CGROUP {stage} current_bytes={} shared_with_other_processes=true",
+                        bytes.trim()
+                    );
+                }
+            }
+        }
+    }
+    fn open(path: &str) -> Arc<crate::Database> {
+        crate::Database::open(
+            Arc::new(crate::PlatformIO::new().unwrap()),
+            path,
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+                .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+        )
+        .unwrap()
+    }
+    if let Ok(path) = std::env::var(PATH_ENV) {
+        let clients: usize = std::env::var(CLIENTS_ENV).unwrap().parse().unwrap();
+        memory("before_open");
+        let db = open(&path);
+        memory("before_query");
+        let connections: Vec<_> = (0..clients).map(|_| db.connect().unwrap()).collect();
+        let ready = std::sync::Barrier::new(clients);
+        let started = std::time::Instant::now();
+        let waves = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for conn in &connections {
+                let ready = &ready;
+                workers.push(scope.spawn(move || {
+                    let mut timings = Vec::new();
+                    ready.wait();
+                    for _ in 0..11 {
+                        let wave = std::time::Instant::now();
+                        for (query, count) in [("needle00000123", 1), ("common", 10)] {
+                            let rows = conn.prepare(format!(
+                                "SELECT id FROM docs WHERE fts_match(body, '{query}') ORDER BY id LIMIT 10"
+                            )).unwrap().run_collect_rows().unwrap();
+                            assert_eq!(rows.len(), count);
+                            if count == 1 { assert_eq!(rows[0], vec![Value::from_i64(123)]); }
+                        }
+                        timings.push(wave.elapsed().as_micros());
+                    }
+                    timings
+                }));
+            }
+            let timings: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            (0..11)
+                .map(|wave| timings.iter().map(|client| client[wave]).max().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (wave, elapsed) in waves.iter().enumerate() {
+            println!("FTS_QUERY clients={clients} wave={wave} elapsed_us={elapsed}");
+        }
+        let mut warm = waves[1..].to_vec();
+        warm.sort_unstable();
+        println!(
+            "FTS_WARM clients={clients} p50_us={} p95_us={} total_ms={}",
+            warm[4],
+            warm[9],
+            started.elapsed().as_millis()
+        );
+        memory("queries_complete_connections_live");
+        drop(connections);
+        drop(db);
+        memory("after_close");
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("fts.db");
+    {
+        let db = open(path.to_str().unwrap());
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        let mut random = 0x45fa_9621_77a3_619bu64;
+        for batch in 0..128 {
+            let mut sql = String::from("INSERT INTO docs VALUES ");
+            for offset in 0..32 {
+                if offset != 0 {
+                    sql.push(',');
+                }
+                let id = batch * 32 + offset;
+                sql.push_str(&format!("({id}, 'common needle{id:08} "));
+                for _ in 0..256 {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    sql.push_str(&format!("word{random:016x} "));
+                }
+                sql.push_str("')");
+            }
+            conn.execute(sql).unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    for clients in [1, 8, 20] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                TEST,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PATH_ENV, &path)
+            .env(CLIENTS_ENV, clients.to_string())
+            .env("HOME", fixture.path())
+            .env("XDG_CACHE_HOME", fixture.path())
+            .env("XDG_DATA_HOME", fixture.path())
+            .output()
+            .unwrap();
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

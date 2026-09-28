@@ -3249,6 +3249,8 @@ pub struct IndexMethodQuery {
     pub arguments: Vec<Expr>,
     /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
     pub covered_columns: HashMap<usize, usize>,
+    /// Bound output expressions paired with their synthetic column IDs.
+    pub covered_expressions: Vec<(Expr, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

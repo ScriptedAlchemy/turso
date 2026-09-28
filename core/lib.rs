@@ -157,6 +157,7 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+pub use storage::buffer_pool::{BufferMemoryAdmission, BufferMemoryReservation};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

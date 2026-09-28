@@ -34,15 +34,20 @@
 //! them. The pre-registry code stored a whole Tantivy directory keyed by
 //! file name, without the `fts2/` prefix.
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet as HashSet;
+#[cfg(test)]
 use std::collections::BTreeSet;
-use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings};
+use tantivy::{
+    Index, IndexMeta, IndexSettings, directory::OwnedBytes, index::SegmentId, schema::Schema,
+};
 
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
 /// Storage format version stored in the control row.
-pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 2;
+pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 3;
 
 pub(super) const FTS2_CONTROL_PATH: &str = "fts2/control";
 pub(super) const FTS2_SEGMENT_PREFIX: &str = "fts2/seg/";
@@ -309,77 +314,100 @@ impl SegmentDescriptor {
     }
 }
 
-/// Every document identity of one immutable segment, readable in both
-/// directions. Position (the document's number inside the segment) to
-/// identity is for writing a tombstone. Identity to position is for applying
-/// one. The code builds it once per segment load and caches it with the
-/// segment bytes, because a segment never changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) struct SegmentIdentities {
-    by_position: Vec<DocumentIdentity>,
-    /// Positions sorted by their identity, for binary search.
-    positions_by_identity: Vec<u32>,
+    hi: tantivy::fastfield::Column<u64>,
+    lo: tantivy::fastfield::Column<u64>,
+    index: Arc<tantivy::InvertedIndexReader>,
+    field: tantivy::schema::Field,
+    max_doc: u32,
+}
+
+impl std::fmt::Debug for SegmentIdentities {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentIdentities")
+            .field("max_doc", &self.max_doc)
+            .finish()
+    }
 }
 
 impl SegmentIdentities {
-    pub fn new(by_position: Vec<DocumentIdentity>) -> Self {
-        let mut positions_by_identity: Vec<u32> = (0..by_position.len() as u32).collect();
-        positions_by_identity.sort_unstable_by_key(|position| by_position[*position as usize]);
+    pub fn new(
+        hi: tantivy::fastfield::Column<u64>,
+        lo: tantivy::fastfield::Column<u64>,
+        index: Arc<tantivy::InvertedIndexReader>,
+        field: tantivy::schema::Field,
+        max_doc: u32,
+    ) -> Self {
         Self {
-            by_position,
-            positions_by_identity,
+            hi,
+            lo,
+            index,
+            field,
+            max_doc,
         }
-    }
-
-    pub fn resident_bytes(&self) -> usize {
-        self.by_position.len() * (size_of::<DocumentIdentity>() + size_of::<u32>())
     }
 
     pub fn identity_of(&self, position: u32) -> Option<DocumentIdentity> {
-        self.by_position.get(position as usize).copied()
-    }
-
-    pub fn position_of(&self, identity: DocumentIdentity) -> Option<u32> {
-        self.positions_by_identity
-            .binary_search_by_key(&identity, |position| self.by_position[*position as usize])
-            .ok()
-            .map(|index| self.positions_by_identity[index])
-    }
-
-    /// The positions of every document whose identity is in `tombstones`.
-    /// Walks whichever side is smaller: the tombstone set or the segment.
-    pub fn tombstoned_positions(&self, tombstones: &HashSet<DocumentIdentity>) -> BTreeSet<u32> {
-        if tombstones.len() < self.by_position.len() {
-            tombstones
-                .iter()
-                .filter_map(|identity| self.position_of(*identity))
-                .collect()
-        } else {
-            self.by_position
-                .iter()
-                .enumerate()
-                .filter(|(_, identity)| tombstones.contains(identity))
-                .map(|(position, _)| position as u32)
-                .collect()
+        if position >= self.max_doc {
+            return None;
         }
+        self.hi
+            .first(position)
+            .zip(self.lo.first(position))
+            .map(|(hi, lo)| DocumentIdentity::new((u128::from(hi) << 64) | u128::from(lo)))
+    }
+
+    pub fn position_of(&self, identity: DocumentIdentity) -> Result<Option<u32>> {
+        use tantivy::DocSet;
+        let term = tantivy::Term::from_field_u64(self.field, identity.raw() as u64);
+        let Some(mut postings) = self
+            .index
+            .read_postings(&term, tantivy::schema::IndexRecordOption::Basic)
+            .map_err(|error| LimboError::Corrupt(format!("FTS identity postings: {error}")))?
+        else {
+            return Ok(None);
+        };
+        while postings.doc() != tantivy::TERMINATED {
+            let position = postings.doc();
+            if self.identity_of(position) == Some(identity) {
+                return Ok(Some(position));
+            }
+            postings.advance();
+        }
+        Ok(None)
+    }
+
+    pub fn tombstoned_positions(
+        &self,
+        tombstones: impl Iterator<Item = DocumentIdentity>,
+        directory: &std::path::Path,
+    ) -> Result<DeletedDocs> {
+        let mut deleted = DeletedDocs::new(self.max_doc, directory);
+        for identity in tombstones {
+            if let Some(position) = self.position_of(identity)? {
+                deleted.insert(position)?;
+            }
+        }
+        Ok(deleted)
     }
 }
 
-/// The resident bytes of one immutable segment: each file's contents by
+/// The mapped bytes of one immutable segment: each file's contents by
 /// file name, plus its document identities. Connections share it, keyed by
 /// segment id. A segment never changes, so the cache needs no snapshot
 /// identity.
 #[derive(Debug)]
 pub(super) struct SegmentData {
-    pub files: HashMap<String, Arc<[u8]>>,
+    pub files: HashMap<String, OwnedBytes>,
     pub identities: SegmentIdentities,
     pub total_bytes: usize,
 }
 
 impl SegmentData {
-    pub fn new(files: HashMap<String, Arc<[u8]>>, identities: SegmentIdentities) -> Self {
-        let total_bytes =
-            files.values().map(|data| data.len()).sum::<usize>() + identities.resident_bytes();
+    pub fn new(files: HashMap<String, OwnedBytes>, identities: SegmentIdentities) -> Self {
+        let total_bytes = files.values().map(|data| data.len()).sum::<usize>();
         Self {
             files,
             identities,
@@ -388,28 +416,153 @@ impl SegmentData {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct DeletedDocs {
+    max_doc: u32,
+    count: usize,
+    map: Option<memmap2::MmapMut>,
+    directory: std::path::PathBuf,
+}
+
+impl DeletedDocs {
+    pub fn new(max_doc: u32, directory: &std::path::Path) -> Self {
+        Self {
+            max_doc,
+            count: 0,
+            map: None,
+            directory: directory.to_path_buf(),
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        let mut copy = Self::new(self.max_doc, &self.directory);
+        if let Some(mapping) = &self.map {
+            let target = copy.allocate()?;
+            target.copy_from_slice(mapping);
+        }
+        copy.count = self.count;
+        Ok(copy)
+    }
+
+    fn allocate(&mut self) -> Result<&mut memmap2::MmapMut> {
+        if self.map.is_none() {
+            let file = tempfile::tempfile_in(&self.directory)
+                .map_err(|error| crate::error::io_error(error, "create FTS deletion mask"))?;
+            let bytes = u64::from(self.max_doc).div_ceil(64) * 8;
+            file.set_len(bytes)
+                .map_err(|error| crate::error::io_error(error, "size FTS deletion mask"))?;
+            // SAFETY: this unnamed file has one private writable mapping and
+            // its file handle is closed without exposing another writer.
+            let map = unsafe { memmap2::MmapMut::map_mut(&file) }
+                .map_err(|error| crate::error::io_error(error, "map FTS deletion mask"))?;
+            self.map = Some(map);
+        }
+        self.map
+            .as_mut()
+            .ok_or_else(|| LimboError::InternalError("FTS deletion mask missing".into()))
+    }
+
+    pub fn insert(&mut self, position: u32) -> Result<bool> {
+        if position >= self.max_doc {
+            return Err(LimboError::Corrupt("FTS deletion outside segment".into()));
+        }
+        let byte = position as usize / 8;
+        let bit = 1u8 << (position % 8);
+        let map = self.allocate()?;
+        if map[byte] & bit != 0 {
+            return Ok(false);
+        }
+        map[byte] |= bit;
+        self.count += 1;
+        Ok(true)
+    }
+
+    pub fn contains(&self, position: &u32) -> bool {
+        *position < self.max_doc
+            && self
+                .map
+                .as_ref()
+                .is_some_and(|map| map[*position as usize / 8] & (1 << (*position % 8)) != 0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.max_doc).filter(|position| self.contains(position))
+    }
+
+    pub fn alive_file(&self) -> Result<OwnedBytes> {
+        let mut file = super::directory::StagedFile::new(&self.directory)?;
+        let mut checksum = crc32fast::Hasher::new();
+        let header = self.max_doc.to_le_bytes();
+        checksum.update(&header);
+        file.append(0, &header)?;
+        let words = u64::from(self.max_doc).div_ceil(64);
+        for word in 0..words {
+            let offset = word as usize * 8;
+            let deleted = self.map.as_ref().map_or(0, |map| {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&map[offset..offset + 8]);
+                u64::from_le_bytes(bytes)
+            });
+            let mut alive = !deleted;
+            if word + 1 == words && self.max_doc % 64 != 0 {
+                alive &= (1u64 << (self.max_doc % 64)) - 1;
+            }
+            let bytes = alive.to_le_bytes();
+            checksum.update(&bytes);
+            file.append(i64::from(file.chunks), &bytes)?;
+        }
+        let footer =
+            serde_json::json!({ "version": tantivy::version(), "crc": checksum.finalize() });
+        let payload = serde_json::to_vec(&footer)
+            .map_err(|error| LimboError::InternalError(format!("FTS footer synthesis: {error}")))?;
+        let length = u32::try_from(payload.len()).map_err(|_| LimboError::TooBig)?;
+        for bytes in [
+            &payload[..],
+            &length.to_le_bytes(),
+            &FOOTER_MAGIC_NUMBER.to_le_bytes(),
+        ] {
+            file.append(i64::from(file.chunks), bytes)?;
+        }
+        file.finish()
+    }
+}
+
 /// One segment as seen by a cursor's snapshot: immutable bytes plus the
 /// tombstoned doc ids visible at (or created by) this transaction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct LoadedSegment {
     pub descriptor: SegmentDescriptor,
     pub data: Arc<SegmentData>,
     /// Doc ids whose postings are dead at this snapshot. Ordered so cache
     /// identity comparisons and bitset builds are deterministic.
-    pub deleted: BTreeSet<u32>,
+    pub deleted: DeletedDocs,
 }
 
 impl LoadedSegment {
     pub fn new(
         descriptor: SegmentDescriptor,
         data: Arc<SegmentData>,
-        deleted: BTreeSet<u32>,
+        deleted: DeletedDocs,
     ) -> Self {
         Self {
             descriptor,
             data,
             deleted,
         }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self::new(
+            self.descriptor.clone(),
+            Arc::clone(&self.data),
+            self.deleted.try_clone()?,
+        ))
     }
 
     pub fn id(&self) -> SegmentId {
@@ -424,7 +577,7 @@ impl LoadedSegment {
     pub fn tombstoned_identities(&self) -> impl Iterator<Item = DocumentIdentity> + '_ {
         self.deleted
             .iter()
-            .filter_map(|position| self.data.identities.identity_of(*position))
+            .filter_map(|position| self.data.identities.identity_of(position))
     }
 
     pub fn meta_spec(&self) -> SegmentMetaSpec {
@@ -472,6 +625,7 @@ impl SegmentMetaSpec {
 
 /// Serialize an alive bitset in Tantivy's `.del` format:
 /// `[u32 max_value LE][ceil(max_value/64) x u64 words LE]`, bit set = alive.
+#[cfg(test)]
 pub(super) fn alive_bitset_bytes(max_doc: u32, deleted: &BTreeSet<u32>) -> Vec<u8> {
     let words = (max_doc as usize).div_ceil(64);
     let mut bytes = Vec::with_capacity(4 + words * 8);
@@ -566,22 +720,72 @@ pub(super) fn tombstone_del_file_name(segment_id: &SegmentId) -> String {
 /// bytes derived from tombstone rows) need it added.
 const FOOTER_MAGIC_NUMBER: u32 = 1337;
 
-pub(super) fn with_tantivy_footer(mut body: Vec<u8>) -> Result<Vec<u8>> {
-    let crc = crc32fast::hash(&body);
-    let footer = serde_json::json!({ "version": tantivy::version(), "crc": crc });
-    let payload = serde_json::to_vec(&footer)
-        .map_err(|e| LimboError::InternalError(format!("FTS footer synthesis failed: {e}")))?;
-    let payload_len = u32::try_from(payload.len())
-        .map_err(|_| LimboError::InternalError("FTS footer payload is too long".into()))?;
-    body.extend_from_slice(&payload);
-    body.extend_from_slice(&payload_len.to_le_bytes());
-    body.extend_from_slice(&FOOTER_MAGIC_NUMBER.to_le_bytes());
-    Ok(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identities(values: Vec<DocumentIdentity>) -> SegmentIdentities {
+        let mut schema = Schema::builder();
+        let hi = schema.add_u64_field("hi", tantivy::schema::FAST);
+        let lo = schema.add_u64_field("lo", tantivy::schema::FAST | tantivy::schema::INDEXED);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for identity in &values {
+            let mut document = tantivy::TantivyDocument::default();
+            document.add_u64(hi, (identity.raw() >> 64) as u64);
+            document.add_u64(lo, identity.raw() as u64);
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        let reader: tantivy::IndexReader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        SegmentIdentities::new(
+            segment.fast_fields().u64("hi").unwrap(),
+            segment.fast_fields().u64("lo").unwrap(),
+            segment.inverted_index(lo).unwrap(),
+            lo,
+            values.len() as u32,
+        )
+    }
+
+    fn positions(
+        identities: &SegmentIdentities,
+        tombstones: &HashSet<DocumentIdentity>,
+    ) -> BTreeSet<u32> {
+        let directory = tempfile::tempdir().unwrap();
+        identities
+            .tombstoned_positions(tombstones.iter().copied(), directory.path())
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    #[test]
+    fn mapped_deletions_keep_snapshot_copies_independent_and_encode_tail_bits() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut deleted = DeletedDocs::new(130, directory.path());
+        assert!(!deleted.insert(131).is_ok());
+        for position in [0, 63, 64, 129] {
+            assert!(deleted.insert(position).unwrap());
+        }
+        assert!(!deleted.insert(64).unwrap());
+        let copy = deleted.try_clone().unwrap();
+        deleted.insert(1).unwrap();
+        assert!(!copy.contains(&1));
+        assert_eq!(copy.iter().collect::<Vec<_>>(), [0, 63, 64, 129]);
+        let bytes = copy.alive_file().unwrap();
+        let bitset = tantivy::fastfield::AliveBitSet::open(bytes.slice(0..28));
+        assert_eq!(bitset.num_alive_docs(), 126);
+        for position in 0..130 {
+            assert_eq!(bitset.is_alive(position), !copy.contains(&position));
+        }
+        drop(bitset);
+        drop(bytes);
+        drop(copy);
+        drop(deleted);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn control_record_round_trips_and_detects_corruption() {
@@ -637,7 +841,7 @@ mod tests {
     #[test]
     fn segment_identities_map_both_ways_and_find_tombstoned_positions() {
         let identity = DocumentIdentity::new;
-        let identities = SegmentIdentities::new(vec![
+        let identities = test_identities(vec![
             identity(500),
             identity(20),
             identity(9_000),
@@ -645,39 +849,30 @@ mod tests {
         ]);
         assert_eq!(identities.identity_of(2), Some(identity(9_000)));
         assert_eq!(identities.identity_of(4), None);
-        assert_eq!(identities.position_of(identity(3)), Some(3));
-        assert_eq!(identities.position_of(identity(500)), Some(0));
-        assert_eq!(identities.position_of(identity(42)), None);
+        assert_eq!(identities.position_of(identity(3)).unwrap(), Some(3));
+        assert_eq!(identities.position_of(identity(500)).unwrap(), Some(0));
+        assert_eq!(identities.position_of(identity(42)).unwrap(), None);
 
         let few = HashSet::from_iter([identity(20), identity(42)]);
-        assert_eq!(identities.tombstoned_positions(&few), BTreeSet::from([1]));
+        assert_eq!(positions(&identities, &few), BTreeSet::from([1]));
         let many = HashSet::from_iter([3, 20, 500, 9_000, 1, 2].map(identity));
-        assert_eq!(
-            identities.tombstoned_positions(&many),
-            BTreeSet::from([0, 1, 2, 3])
-        );
-        assert!(identities
-            .tombstoned_positions(&HashSet::default())
-            .is_empty());
+        assert_eq!(positions(&identities, &many), BTreeSet::from([0, 1, 2, 3]));
+        assert!(positions(&identities, &HashSet::default()).is_empty());
     }
 
     #[test]
     fn identity_lookup_distinguishes_high_bits() {
         let low = DocumentIdentity::new(7);
         let high = DocumentIdentity::new((1 << 100) | 7);
-        let identities = SegmentIdentities::new(vec![high, low]);
-        assert_eq!(identities.position_of(high), Some(0));
-        assert_eq!(identities.position_of(low), Some(1));
+        let identities = test_identities(vec![high, low]);
+        assert_eq!(identities.position_of(high).unwrap(), Some(0));
+        assert_eq!(identities.position_of(low).unwrap(), Some(1));
         for tombstones in [
             HashSet::from_iter([high]),
             HashSet::from_iter([high, DocumentIdentity::new(99)]),
         ] {
-            assert_eq!(
-                identities.tombstoned_positions(&tombstones),
-                BTreeSet::from([0])
-            );
+            assert_eq!(positions(&identities, &tombstones), BTreeSet::from([0]));
         }
-        assert_eq!(identities.resident_bytes(), 40);
     }
 
     #[test]

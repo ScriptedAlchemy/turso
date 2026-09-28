@@ -662,6 +662,10 @@ impl SharedBufferData {
 }
 
 pub enum Buffer {
+    Admitted {
+        data: BufferData,
+        _reservation: Box<dyn crate::storage::buffer_pool::BufferMemoryReservation>,
+    },
     Heap(BufferData),
     Shared(SharedBufferData),
     /// A heap buffer with a logical start offset: only `data[start..]` is
@@ -678,7 +682,9 @@ impl Debug for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
-            Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
+            Self::Heap(buf) | Self::Admitted { data: buf, .. } => {
+                write!(f, "{buf:?}: {}", buf.len())
+            }
             Self::Shared(buf) => write!(f, "Shared(len={})", buf.len()),
             Self::HeapView { data, start } => {
                 write!(
@@ -704,7 +710,7 @@ impl Drop for Buffer {
                     cache.return_buffer(buffer, underlying_len);
                 });
             }
-            Self::Pooled(_) | Self::Shared(_) => {}
+            Self::Pooled(_) | Self::Shared(_) | Self::Admitted { .. } => {}
         }
     }
 }
@@ -744,13 +750,35 @@ impl Buffer {
     /// io_uring. Only for use with `UringIO` backend.
     pub fn fixed_id(&self) -> Option<u32> {
         match self {
-            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) => None,
+            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) | Self::Admitted { .. } => {
+                None
+            }
             Self::Pooled(buf) => buf.fixed_id(),
         }
     }
 
     pub fn new_pooled(buf: ArenaBuffer) -> Self {
         Self::Pooled(buf)
+    }
+
+    pub(crate) fn try_new_temporary(
+        size: usize,
+        admission: &Option<Arc<dyn crate::storage::buffer_pool::BufferMemoryAdmission>>,
+    ) -> crate::Result<Self> {
+        let Some(reservation) =
+            crate::storage::buffer_pool::reserve_buffer_memory(admission, size)?
+        else {
+            return Ok(Self::new_temporary(size));
+        };
+        // Charged memory must not escape into the unowned thread-local cache.
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| crate::LimboError::OutOfMemory)?;
+        data.resize(size, 0);
+        Ok(Self::Admitted {
+            data: Pin::new(data.into_boxed_slice()),
+            _reservation: reservation,
+        })
     }
 
     pub fn new_temporary(size: usize) -> Self {
@@ -765,7 +793,7 @@ impl Buffer {
 
     pub fn len(&self) -> usize {
         match self {
-            Self::Heap(buf) => buf.len(),
+            Self::Heap(buf) | Self::Admitted { data: buf, .. } => buf.len(),
             Self::Shared(buf) => buf.len(),
             Self::HeapView { data, start } => data.len() - *start,
             Self::Pooled(buf) => buf.logical_len(),
@@ -778,7 +806,7 @@ impl Buffer {
 
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Heap(buf) => {
+            Self::Heap(buf) | Self::Admitted { data: buf, .. } => {
                 // SAFETY: The buffer is guaranteed to be valid for the lifetime of the slice
                 unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) }
             }
@@ -801,7 +829,7 @@ impl Buffer {
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         match self {
-            Self::Heap(buf) => buf.as_ptr(),
+            Self::Heap(buf) | Self::Admitted { data: buf, .. } => buf.as_ptr(),
             Self::Shared(buf) => buf.as_ptr(),
             Self::HeapView { data, start } => unsafe { data.as_ptr().add(*start) },
             Self::Pooled(buf) => buf.as_ptr(),
@@ -810,7 +838,7 @@ impl Buffer {
     #[inline]
     pub fn as_mut_ptr(&self) -> *mut u8 {
         match self {
-            Self::Heap(buf) => buf.as_ptr() as *mut u8,
+            Self::Heap(buf) | Self::Admitted { data: buf, .. } => buf.as_ptr() as *mut u8,
             Self::Shared(_) => panic!("Buffer::Shared is immutable"),
             Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
@@ -824,7 +852,10 @@ impl Buffer {
 
     #[inline]
     pub fn is_heap(&self) -> bool {
-        matches!(self, Self::Heap(..) | Self::HeapView { .. })
+        matches!(
+            self,
+            Self::Heap(..) | Self::HeapView { .. } | Self::Admitted { .. }
+        )
     }
 }
 

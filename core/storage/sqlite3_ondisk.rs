@@ -557,7 +557,13 @@ pub fn begin_read_page(
     group: Option<&mut CompletionGroup>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
-    let buf = buffer_pool.get_page();
+    let buf = match buffer_pool.get_page() {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            page.clear_locked();
+            return Err(error);
+        }
+    };
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -2034,7 +2040,7 @@ pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
     complete: Box<ReadComplete>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
-    let buf = Arc::new(buffer_pool.get_wal_frame());
+    let buf = Arc::new(buffer_pool.get_wal_frame()?);
     let c = Completion::new_read(buf, complete);
     let c = io.pread(offset, c)?;
     Ok(c)
@@ -2056,7 +2062,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         offset,
         page_idx
     );
-    let buf = buffer_pool.get_page();
+    let buf = buffer_pool.get_page()?;
     let buf = Arc::new(buf);
 
     let complete: Box<ReadComplete> = match io_ctx.page_transform() {
@@ -2064,7 +2070,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let page_codec = ctx.clone();
             let original_complete = complete;
             // TODO(v): support in-place codec decoding to avoid this extra page buffer.
-            let decoded_buf = Arc::new(buffer_pool.get_page());
+            let decoded_buf = Arc::new(buffer_pool.get_page()?);
             let codec_context = PageCodecContext::from_page_idx(page_idx, PageLocation::Wal)?;
 
             Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -2159,16 +2165,16 @@ pub fn prepare_wal_frame(
     page_number: u32,
     db_size: u32,
     page: &[u8],
-) -> ((u32, u32), Arc<Buffer>) {
+) -> Result<((u32, u32), Arc<Buffer>)> {
     tracing::trace!(page_number);
 
-    let buffer = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
+    let buffer = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size)?;
     let frame = buffer.as_mut_slice();
     frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page);
 
     let final_checksum = recompute_wal_frame_checksum(frame, wal_header, prev_checksums);
 
-    (final_checksum, buffer)
+    Ok((final_checksum, buffer))
 }
 
 /// Prepares a WAL frame header while leaving the page body for a transform to fill.
@@ -2180,14 +2186,14 @@ pub(crate) fn prepare_wal_frame_header(
     wal_header: &WalHeader,
     page_number: u32,
     db_size: u32,
-) -> Arc<Buffer> {
-    let buffer = Arc::new(buffer_pool.get_wal_frame());
+) -> Result<Arc<Buffer>> {
+    let buffer = Arc::new(buffer_pool.get_wal_frame()?);
     let frame = buffer.as_mut_slice();
     frame[0..4].copy_from_slice(&page_number.to_be_bytes());
     frame[4..8].copy_from_slice(&db_size.to_be_bytes());
     frame[8..12].copy_from_slice(&wal_header.salt_1.to_be_bytes());
     frame[12..16].copy_from_slice(&wal_header.salt_2.to_be_bytes());
-    buffer
+    Ok(buffer)
 }
 
 /// Recompute a frame checksum after transforming its page body in place.
@@ -2626,7 +2632,8 @@ mod tests {
             1,
             1,
             &page,
-        );
+        )
+        .unwrap();
         let commit_frame_clone = commit_frame.clone();
         let c = file
             .pwrite(
@@ -2649,7 +2656,8 @@ mod tests {
             2,
             0,
             &page,
-        );
+        )
+        .unwrap();
         let frame2_clone = frame2.clone();
         let c = file
             .pwrite(
@@ -2672,7 +2680,8 @@ mod tests {
             3,
             0,
             &page,
-        );
+        )
+        .unwrap();
         let frame3_clone = frame3.clone();
         let c = file
             .pwrite(

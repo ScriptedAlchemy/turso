@@ -200,6 +200,7 @@ pub struct DatabaseAllocators<
 > {
     pub mv_store: M,
     pub fts: F,
+    pub buffer_memory: Option<Arc<dyn crate::storage::buffer_pool::BufferMemoryAdmission>>,
 }
 
 /// Options for opening a [`Database`].
@@ -761,6 +762,8 @@ impl Database {
 
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
+        let buffer_pool =
+            BufferPool::begin_init_with_memory(io, arena_size, allocators.buffer_memory.clone());
         let db = Database {
             mv_store,
             allocators,
@@ -782,7 +785,7 @@ impl Database {
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
             opts,
-            buffer_pool: BufferPool::begin_init(io, arena_size),
+            buffer_pool,
             n_connections: AtomicUsize::new(0),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a

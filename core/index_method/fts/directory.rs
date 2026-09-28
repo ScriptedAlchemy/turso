@@ -1,7 +1,7 @@
 //! Tantivy `Directory` implementations for segment-registry storage.
 //!
 //! Tantivy's `Directory` trait is synchronous while Turso storage is
-//! asynchronous, so every byte a directory serves must already be resident:
+//! asynchronous, so directory callbacks read immutable file mappings:
 //! the cursor loads segment contents through its resumable state machine
 //! before any Tantivy object is constructed, and captures every byte Tantivy
 //! writes so the cursor can persist it afterwards. Directory callbacks never
@@ -9,7 +9,7 @@
 //!
 //! Two directories cover the two directions:
 //!
-//! * [`SnapshotDirectory`] — an immutable per-snapshot read view: resident
+//! * [`SnapshotDirectory`] — an immutable per-snapshot read view: mapped
 //!   segment files, synthesized `meta.json` and `.del` files. Nothing can be
 //!   written through it.
 //! * [`BuildDirectory`] — a private write buffer for building one immutable
@@ -24,7 +24,6 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufWriter, Write};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
@@ -33,49 +32,68 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite, WatchCallback,
     WatchHandle,
 };
-use tantivy::HasLen;
 
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
 use crate::alloc::{
-    try_arc_slice_from_slice_in, ArcSlice, DynAllocator, DynVec, TursoFromIterator,
+    ArcSlice, DynAllocator, DynVec, TursoFromIterator, try_arc_slice_from_slice_in,
 };
 use crate::sync::Arc;
 
 const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_MANAGED_FILE: &str = ".managed.json";
 
-/// In-memory file handle over resident bytes.
-pub(super) struct InMemoryFileHandle {
-    data: Arc<[u8]>,
+#[derive(Debug)]
+pub(super) struct StagedFile {
+    file: BufWriter<std::fs::File>,
+    pub chunks: u32,
+    pub bytes: u64,
 }
 
-impl std::fmt::Debug for InMemoryFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InMemoryFileHandle")
-            .field("len", &self.data.len())
-            .finish()
+impl StagedFile {
+    pub fn new(directory: &Path) -> crate::Result<Self> {
+        let file = tempfile::tempfile_in(directory)
+            .map_err(|error| crate::error::io_error(error, "create FTS staging file"))?;
+        Ok(Self {
+            file: BufWriter::new(file),
+            chunks: 0,
+            bytes: 0,
+        })
     }
-}
 
-impl HasLen for InMemoryFileHandle {
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-}
-
-impl FileHandle for InMemoryFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        if range.end > self.data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "range exceeds file length",
-            ));
+    pub fn append(&mut self, chunk: i64, bytes: &[u8]) -> crate::Result<()> {
+        if chunk != i64::from(self.chunks) {
+            return Err(crate::LimboError::Corrupt(format!(
+                "FTS file expected chunk {}, found {chunk}",
+                self.chunks
+            )));
         }
-        if range.start >= range.end {
+        self.file
+            .write_all(bytes)
+            .map_err(|error| crate::error::io_error(error, "write FTS staging file"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or(crate::LimboError::TooBig)?;
+        self.chunks = self
+            .chunks
+            .checked_add(1)
+            .ok_or(crate::LimboError::TooBig)?;
+        Ok(())
+    }
+
+    pub fn finish(self) -> crate::Result<OwnedBytes> {
+        if self.bytes == 0 {
             return Ok(OwnedBytes::empty());
         }
-        Ok(OwnedBytes::new(Arc::clone(&self.data)).slice(range))
+        let file = self.file.into_inner().map_err(|error| {
+            crate::error::io_error(error.into_error(), "flush FTS staging file")
+        })?;
+        // SAFETY: the unnamed file is private, all writes have completed, and
+        // its only writable handle is closed after mapping.
+        let mapping = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|error| crate::error::io_error(error, "map FTS staging file"))?;
+        Ok(OwnedBytes::new(mapping))
     }
 }
 
@@ -94,23 +112,23 @@ fn noop_lock() -> DirectoryLock {
 /// from the visible registry rows; no stored file ever carries that name.
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
-    files: Arc<HashMap<PathBuf, Arc<[u8]>>>,
-    meta_json: Arc<[u8]>,
+    files: Arc<HashMap<PathBuf, OwnedBytes>>,
+    meta_json: OwnedBytes,
 }
 
 impl SnapshotDirectory {
-    pub fn new(files: HashMap<PathBuf, Arc<[u8]>>, meta_json: Vec<u8>) -> Self {
+    pub fn new(files: HashMap<PathBuf, OwnedBytes>, meta_json: Vec<u8>) -> Self {
         Self {
             files: Arc::new(files),
-            meta_json: Arc::from(meta_json),
+            meta_json: OwnedBytes::new(meta_json),
         }
     }
 
-    fn lookup(&self, path: &Path) -> Option<Arc<[u8]>> {
+    fn lookup(&self, path: &Path) -> Option<OwnedBytes> {
         if path == Path::new(TANTIVY_META_FILE) {
-            return Some(Arc::clone(&self.meta_json));
+            return Some(self.meta_json.clone());
         }
-        self.files.get(path).map(Arc::clone)
+        self.files.get(path).cloned()
     }
 }
 
@@ -129,7 +147,7 @@ impl Directory for SnapshotDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         match self.lookup(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle { data })),
+            Some(data) => Ok(Arc::new(data)),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
@@ -197,7 +215,7 @@ impl Directory for SnapshotDirectory {
 #[derive(Debug, Default)]
 struct BuildDirectoryInner {
     /// Segment files captured on terminate, footer included.
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, OwnedBytes>,
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
     atomic: HashMap<PathBuf, ArcSlice<u8>>,
@@ -224,7 +242,7 @@ impl BuildDirectory {
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
     /// construction.
-    pub fn captured_files(&self) -> HashMap<PathBuf, Arc<[u8]>> {
+    pub fn captured_files(&self) -> HashMap<PathBuf, OwnedBytes> {
         self.inner.read().files.clone()
     }
 
@@ -288,7 +306,7 @@ impl Drop for CaptureWriter {
 
 impl TerminatingWrite for CaptureWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        let data = Arc::from(self.buffer.as_slice());
+        let data = OwnedBytes::new(self.buffer.as_slice().to_vec());
         self.inner.write().files.insert(self.path.clone(), data);
         self.buffer.clear();
         Ok(())
@@ -301,9 +319,7 @@ impl Directory for BuildDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         match self.inner.read().files.get(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle {
-                data: Arc::clone(data),
-            })),
+            Some(data) => Ok(Arc::new(data.clone())),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }

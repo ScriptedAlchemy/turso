@@ -17,13 +17,13 @@
 use super::format::segment_registry_path;
 use crate::types::IOResultOr;
 use crate::{
+    LimboError, Result,
     numeric::Numeric,
     return_if_io,
     storage::btree::{BTreeKey, CursorTrait},
     types::{
         IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, TextRef, TextSubtype, ValueRef,
     },
-    LimboError, Result,
 };
 use tantivy::index::SegmentId;
 

@@ -11,6 +11,26 @@ use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+/// An allocation charge released only after its backing memory is freed.
+pub trait BufferMemoryReservation: std::fmt::Debug + Send + Sync {}
+
+impl<T: std::fmt::Debug + Send + Sync> BufferMemoryReservation for T {}
+
+/// Host admission for database arenas and overflow buffers.
+pub trait BufferMemoryAdmission: std::fmt::Debug + Send + Sync {
+    fn reserve(&self, bytes: usize) -> crate::Result<Box<dyn BufferMemoryReservation>>;
+}
+
+pub(crate) fn reserve_buffer_memory(
+    admission: &Option<Arc<dyn BufferMemoryAdmission>>,
+    bytes: usize,
+) -> crate::Result<Option<Box<dyn BufferMemoryReservation>>> {
+    admission
+        .as_ref()
+        .map(|authority| authority.reserve(bytes))
+        .transpose()
+}
+
 #[derive(Debug)]
 /// A buffer allocated from an arena from `[BufferPool]`
 pub struct ArenaBuffer {
@@ -108,6 +128,7 @@ struct PoolInner {
     wal_frame_arena: Option<Arc<Arena>>,
     /// The size of each `Arena`, in bytes.
     arena_size: usize,
+    memory_admission: Option<Arc<dyn BufferMemoryAdmission>>,
     /// The `[Database::page_size]`, which the `page_arena` will use to
     /// return buffers from `Self::get_page`.
     db_page_size: OnceLock<usize>,
@@ -147,6 +168,7 @@ impl BufferPool {
                 page_arena: None,
                 wal_frame_arena: None,
                 arena_size,
+                memory_admission: None,
                 db_page_size: OnceLock::new(),
                 io: None,
             }),
@@ -155,13 +177,13 @@ impl BufferPool {
 
     /// Request a `Buffer` of size `len`
     #[inline]
-    pub fn allocate(&self, len: usize) -> Buffer {
+    pub fn allocate(&self, len: usize) -> crate::Result<Buffer> {
         self.inner().allocate(len)
     }
 
     /// Request a `Buffer` the size of the `db_page_size` the `BufferPool` was initialized with.
     #[inline]
-    pub fn get_page(&self) -> Buffer {
+    pub fn get_page(&self) -> crate::Result<Buffer> {
         let inner = self.inner_mut();
         inner.get_db_page_buffer()
     }
@@ -169,7 +191,7 @@ impl BufferPool {
     /// Request a `Buffer` for use with a WAL frame,
     /// `[Database::page_size] + `WAL_FRAME_HEADER_SIZE`
     #[inline]
-    pub fn get_wal_frame(&self) -> Buffer {
+    pub fn get_wal_frame(&self) -> crate::Result<Buffer> {
         let inner = self.inner_mut();
         inner.get_wal_frame_buffer()
     }
@@ -199,6 +221,16 @@ impl BufferPool {
         pool
     }
 
+    pub(crate) fn begin_init_with_memory(
+        io: &Arc<dyn IO>,
+        arena_size: usize,
+        memory_admission: Option<Arc<dyn BufferMemoryAdmission>>,
+    ) -> Arc<Self> {
+        let pool = Self::begin_init(io, arena_size);
+        pool.inner_mut().memory_admission = memory_admission;
+        pool
+    }
+
     /// Call when `[Database::db_state]` is initialized, providing the `page_size` to allocate
     /// an arena for the pool. Before this call, the pool will use temporary buffers which are
     /// cached in thread local storage.
@@ -217,14 +249,8 @@ impl BufferPool {
             return Ok(());
         }
 
-        // Tries to atomically (guarenteed by the OnceLock) initialize the page size for the inner pool.
-        // If it succeeds, we now have to initialize the arenas.
-        // If the initialization fails, this means the arenas have already been initialized by a previous thread
-        // This avoids a potential TOCTOU race, where 2 threads could try to initalize the arena at the same time
-        // after checking the `db_page_size`
-        if inner.db_page_size.set(page_size).is_ok() {
-            inner.init_arenas()?;
-        };
+        inner.db_page_size.get_or_init(|| page_size);
+        inner.init_arenas()?;
         Ok(())
     }
 }
@@ -238,43 +264,29 @@ impl PoolInner {
             .unwrap_or(&BufferPool::DEFAULT_PAGE_SIZE))
     }
 
-    /// Allocate a buffer of the given length from the pool, falling back to
-    /// temporary thread local buffers if the pool is not initialized or is full.
-    pub fn allocate(&self, len: usize) -> Buffer {
+    /// Overflow allocations retain the same admission authority as their arena.
+    pub fn allocate(&self, len: usize) -> crate::Result<Buffer> {
         turso_assert!(len > 0, "Cannot allocate zero-length buffer");
-
-        let db_page_size = self.get_db_page_size();
-        let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
-
-        // Check if this is exactly a WAL frame size allocation
-        if len == wal_frame_size {
-            return self
-                .wal_frame_arena
-                .as_ref()
-                .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-                .unwrap_or_else(|| Buffer::new_temporary(len));
-        }
-        // For all other sizes, use regular arena
-        self.page_arena
+        let arena = if len == self.get_db_page_size() + WAL_FRAME_HEADER_SIZE {
+            &self.wal_frame_arena
+        } else {
+            &self.page_arena
+        };
+        if let Some(buffer) = arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, len))
-            .unwrap_or_else(|| Buffer::new_temporary(len))
+        {
+            return Ok(buffer);
+        }
+        Buffer::try_new_temporary(len, &self.memory_admission)
     }
 
-    fn get_db_page_buffer(&mut self) -> Buffer {
-        let db_page_size = self.get_db_page_size();
-        self.page_arena
-            .as_ref()
-            .and_then(|arena| Arena::try_alloc(arena, db_page_size))
-            .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
+    fn get_db_page_buffer(&mut self) -> crate::Result<Buffer> {
+        self.allocate(self.get_db_page_size())
     }
 
-    fn get_wal_frame_buffer(&mut self) -> Buffer {
-        let len = self.get_db_page_size() + WAL_FRAME_HEADER_SIZE;
-        self.wal_frame_arena
-            .as_ref()
-            .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-            .unwrap_or_else(|| Buffer::new_temporary(len))
+    fn get_wal_frame_buffer(&mut self) -> crate::Result<Buffer> {
+        self.allocate(self.get_db_page_size() + WAL_FRAME_HEADER_SIZE)
     }
 
     /// Allocate a new arena for the pool to use
@@ -284,44 +296,16 @@ impl PoolInner {
 
         let io = self.io.as_ref().expect("Pool not initialized").clone();
 
-        // Create regular page arena
-        match Arena::new(db_page_size, arena_size, &io) {
-            Ok(arena) => {
-                tracing::trace!(
-                    "added arena {} with size {} MB and slot size {}",
-                    arena.id,
-                    arena_size / (1024 * 1024),
-                    db_page_size
-                );
-                self.page_arena = Some(Arc::new(arena));
-            }
-            Err(e) => {
-                tracing::error!("Failed to create arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
-                    "Failed to create arena: {e}",
-                )));
-            }
-        }
-
-        // Create WAL frame arena
-        let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
-        match Arena::new(wal_frame_size, arena_size, &io) {
-            Ok(arena) => {
-                tracing::trace!(
-                    "added WAL frame arena {} with size {} MB and slot size {}",
-                    arena.id,
-                    arena_size / (1024 * 1024),
-                    wal_frame_size
-                );
-                self.wal_frame_arena = Some(Arc::new(arena));
-            }
-            Err(e) => {
-                tracing::error!("Failed to create WAL frame arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
-                    "Failed to create WAL frame arena: {e}",
-                )));
-            }
-        }
+        let page_arena = Arena::new(db_page_size, arena_size, &io, &self.memory_admission)?;
+        let wal_frame_arena = Arena::new(
+            db_page_size + WAL_FRAME_HEADER_SIZE,
+            arena_size,
+            &io,
+            &self.memory_admission,
+        )?;
+        // Publish together: refusal of the second reservation releases the first.
+        self.page_arena = Some(Arc::new(page_arena));
+        self.wal_frame_arena = Some(Arc::new(wal_frame_arena));
 
         Ok(())
     }
@@ -344,6 +328,7 @@ struct Arena {
     arena_size: usize,
     /// Slot size the total arena is divided into.
     slot_size: usize,
+    _reservation: Option<Box<dyn BufferMemoryReservation>>,
 }
 
 // SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
@@ -371,20 +356,26 @@ static NEXT_ID: std::sync::atomic::AtomicU32 =
 impl Arena {
     /// Create a new arena with the given size and page size.
     /// NOTE: Minimum arena size is slot_size * 64
-    fn new(slot_size: usize, arena_size: usize, io: &Arc<dyn IO>) -> Result<Self, String> {
+    fn new(
+        slot_size: usize,
+        arena_size: usize,
+        io: &Arc<dyn IO>,
+        admission: &Option<Arc<dyn BufferMemoryAdmission>>,
+    ) -> crate::Result<Self> {
         let min_slots = arena_size.div_ceil(slot_size);
         let rounded_slots = (min_slots.max(64) + 63) & !63;
         let rounded_bytes = rounded_slots * slot_size;
         // Guard against the global cap
         if unlikely(rounded_bytes > BufferPool::MAX_ARENA_SIZE) {
-            return Err(format!(
+            return Err(LimboError::InternalError(format!(
                 "arena size {} B exceeds hard limit of {} B",
                 rounded_bytes,
                 BufferPool::MAX_ARENA_SIZE
-            ));
+            )));
         }
+        let reservation = reserve_buffer_memory(admission, rounded_bytes)?;
         let ptr = unsafe { arena::alloc(rounded_bytes) };
-        let base = NonNull::new(ptr).ok_or("Failed to allocate arena")?;
+        let base = NonNull::new(ptr).ok_or(LimboError::OutOfMemory)?;
         let id = io
             .register_fixed_buffer(base, rounded_bytes)
             .unwrap_or_else(|_| {
@@ -401,6 +392,7 @@ impl Arena {
             allocated_slots: AtomicUsize::new(0),
             slot_size,
             arena_size: rounded_bytes,
+            _reservation: reservation,
         })
     }
 
@@ -455,7 +447,7 @@ mod arena {
             0,
         );
         if ptr == libc::MAP_FAILED {
-            panic!("mmap failed: {}", std::io::Error::last_os_error());
+            return std::ptr::null_mut();
         }
         #[cfg(target_os = "linux")]
         {
@@ -481,6 +473,147 @@ mod arena {
     pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
         unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+}
+
+#[cfg(all(test, not(shuttle)))]
+mod memory_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Budget {
+        limit: AtomicUsize,
+        used: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct Reservation {
+        bytes: usize,
+        used: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+
+    impl BufferMemoryAdmission for Budget {
+        fn reserve(&self, bytes: usize) -> crate::Result<Box<dyn BufferMemoryReservation>> {
+            self.used
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    used.checked_add(bytes)
+                        .filter(|next| *next <= self.limit.load(Ordering::SeqCst))
+                })
+                .map_err(|_| LimboError::OutOfMemory)?;
+            Ok(Box::new(Reservation {
+                bytes,
+                used: self.used.clone(),
+            }))
+        }
+    }
+
+    fn pool(budget: Arc<Budget>) -> Arc<BufferPool> {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        BufferPool::begin_init_with_memory(&io, BufferPool::TEST_ARENA_SIZE, Some(budget))
+    }
+
+    #[test]
+    fn overflow_refusal_and_release_share_one_authority_across_pools() {
+        let used = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget {
+            limit: AtomicUsize::new(4096),
+            used: used.clone(),
+        });
+        let first = pool(budget.clone());
+        let second = pool(budget);
+        let buffer = first.get_page().unwrap();
+        assert_eq!(used.load(Ordering::SeqCst), 4096);
+        assert!(matches!(second.get_page(), Err(LimboError::OutOfMemory)));
+        // The allocation owns the charge even when its originating pool is gone.
+        drop(first);
+        assert_eq!(used.load(Ordering::SeqCst), 4096);
+        drop(buffer);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+        let next = second.get_page().unwrap();
+        assert_eq!(used.load(Ordering::SeqCst), 4096);
+        drop(next);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn partial_arena_refusal_rolls_back_and_can_retry() {
+        let used = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget {
+            limit: AtomicUsize::new(BufferPool::TEST_ARENA_SIZE),
+            used: used.clone(),
+        });
+        let pool = pool(budget);
+        for _ in 0..2 {
+            assert!(matches!(
+                pool.finalize_with_page_size(4096),
+                Err(LimboError::OutOfMemory)
+            ));
+            assert_eq!(used.load(Ordering::SeqCst), 0);
+            assert!(pool.inner().page_arena.is_none());
+            assert!(pool.inner().wal_frame_arena.is_none());
+        }
+    }
+
+    #[test]
+    fn databases_compete_for_actual_backing_and_release_on_close() {
+        let used = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget {
+            limit: AtomicUsize::new(usize::MAX),
+            used: used.clone(),
+        });
+        let open = || -> crate::Result<(Arc<crate::Database>, Arc<crate::Connection>)> {
+            let database = crate::Database::open(
+                Arc::new(crate::MemoryIO::new()),
+                ":memory:",
+                crate::OpenOptions::new(Arc::new(crate::SqliteDialect)).allocators(
+                    crate::DatabaseAllocators {
+                        buffer_memory: Some(budget.clone()),
+                        ..Default::default()
+                    },
+                ),
+            )?;
+            let connection = database.connect()?;
+            connection.execute("CREATE TABLE items(value INTEGER)")?;
+            Ok((database, connection))
+        };
+        let first = open().unwrap();
+        let first_bytes = used.load(Ordering::SeqCst);
+        assert!(first_bytes > 0);
+        budget.limit.store(first_bytes, Ordering::SeqCst);
+        assert!(matches!(open(), Err(LimboError::OutOfMemory)));
+        assert_eq!(used.load(Ordering::SeqCst), first_bytes);
+        drop(first);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+        let second = open().unwrap();
+        assert_eq!(used.load(Ordering::SeqCst), first_bytes);
+        drop(second);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn arena_charge_lives_until_last_buffer_drops() {
+        let used = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget {
+            limit: AtomicUsize::new(4 * BufferPool::TEST_ARENA_SIZE),
+            used: used.clone(),
+        });
+        let pool = pool(budget);
+        pool.finalize_with_page_size(4096).unwrap();
+        let page_bytes = pool.inner().page_arena.as_ref().unwrap().arena_size;
+        let wal_bytes = pool.inner().wal_frame_arena.as_ref().unwrap().arena_size;
+        assert_eq!(used.load(Ordering::SeqCst), page_bytes + wal_bytes);
+        let buffer = pool.get_page().unwrap();
+        drop(pool);
+        assert_eq!(used.load(Ordering::SeqCst), page_bytes);
+        drop(buffer);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -518,7 +651,7 @@ mod shuttle_tests {
                 for _ in 0..3 {
                     let pool = Arc::clone(&pool);
                     let h = thread::spawn(move || {
-                        let buf = pool.get_page();
+                        let buf = pool.get_page().unwrap();
                         assert_eq!(buf.len(), 4096);
                         buf
                     });
@@ -544,13 +677,13 @@ mod shuttle_tests {
 
                 // Thread 1: allocate and send buffer to be dropped elsewhere
                 let h1 = thread::spawn(move || {
-                    let buf = pool.get_page();
+                    let buf = pool.get_page().unwrap();
                     buf.len() // return length, buffer dropped here
                 });
 
                 // Thread 2: allocate concurrently
                 let h2 = thread::spawn(move || {
-                    let buf = pool2.get_page();
+                    let buf = pool2.get_page().unwrap();
                     buf.len()
                 });
 
@@ -568,7 +701,7 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let pool = create_test_pool();
-                let buf = pool.get_page();
+                let buf = pool.get_page().unwrap();
 
                 // Write some data
                 buf.as_mut_slice()[0] = 42;
@@ -596,18 +729,18 @@ mod shuttle_tests {
                 let pool3 = Arc::clone(&pool);
 
                 let h1 = thread::spawn(move || {
-                    let buf = pool.get_page();
+                    let buf = pool.get_page().unwrap();
                     assert_eq!(buf.len(), 4096);
                 });
 
                 let h2 = thread::spawn(move || {
-                    let buf = pool2.get_wal_frame();
+                    let buf = pool2.get_wal_frame().unwrap();
                     // WAL frame = page_size + WAL_FRAME_HEADER_SIZE (24)
                     assert_eq!(buf.len(), 4096 + WAL_FRAME_HEADER_SIZE);
                 });
 
                 let h3 = thread::spawn(move || {
-                    let buf = pool3.allocate(1024);
+                    let buf = pool3.allocate(1024).unwrap();
                     assert_eq!(buf.len(), 1024);
                 });
 
@@ -633,7 +766,7 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         // Each thread does multiple alloc/drop cycles
                         for _ in 0..2 {
-                            let buf = pool.get_page();
+                            let buf = pool.get_page().unwrap();
                             // Write thread-specific data
                             buf.as_mut_slice()[0] = i as u8;
                             assert_eq!(buf.as_slice()[0], i as u8);
@@ -660,7 +793,7 @@ mod shuttle_tests {
                 let pool = create_test_pool();
 
                 // Allocate and write in main thread
-                let buf = pool.get_page();
+                let buf = pool.get_page().unwrap();
                 for (i, byte) in buf.as_mut_slice().iter_mut().enumerate().take(100) {
                     *byte = (i % 256) as u8;
                 }
@@ -708,7 +841,7 @@ mod shuttle_tests {
             // Also try to allocate while finalizing
             let h3 = thread::spawn(move || {
                 // This may get a temporary buffer if arena isn't ready
-                let buf = pool3.allocate(4096);
+                let buf = pool3.allocate(4096).unwrap();
                 assert_eq!(buf.len(), 4096);
             });
 
@@ -728,7 +861,7 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let pool = create_test_pool();
-                let buf = pool.get_page();
+                let buf = pool.get_page().unwrap();
 
                 // Three distinct byte patterns that threads will race to write
                 const PATTERN_A: u8 = 0xAA;
@@ -786,7 +919,7 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let pool = create_test_pool();
-                let buf = pool.get_page();
+                let buf = pool.get_page().unwrap();
 
                 let ptr = buf.as_ptr() as usize;
                 let len = buf.len();
@@ -855,7 +988,7 @@ mod shuttle_tests {
                 let pool = create_test_pool();
 
                 // Pre-allocate some buffers and write identifying data
-                let mut initial_bufs: Vec<_> = (0..5).map(|_| pool.get_page()).collect();
+                let mut initial_bufs: Vec<_> = (0..5).map(|_| pool.get_page().unwrap()).collect();
                 let initial_ptrs: Vec<usize> =
                     initial_bufs.iter().map(|b| b.as_ptr() as usize).collect();
 
@@ -877,7 +1010,7 @@ mod shuttle_tests {
                 let h2 = thread::spawn(move || {
                     let mut bufs = Vec::new();
                     for i in 0..3 {
-                        let buf = pool2.get_page();
+                        let buf = pool2.get_page().unwrap();
                         assert_eq!(buf.len(), 4096, "Buffer {} has wrong length", i);
                         // Write identifying pattern
                         buf.as_mut_slice()[0] = 0xAA;
@@ -891,7 +1024,7 @@ mod shuttle_tests {
                 let h3 = thread::spawn(move || {
                     let mut bufs = Vec::new();
                     for i in 0..3 {
-                        let buf = pool3.get_page();
+                        let buf = pool3.get_page().unwrap();
                         assert_eq!(buf.len(), 4096, "Buffer {} has wrong length", i);
                         // Write different identifying pattern
                         buf.as_mut_slice()[0] = 0xBB;
@@ -960,7 +1093,7 @@ mod shuttle_tests {
                 }
 
                 // Verify we can still allocate after all this
-                let final_buf = pool.get_page();
+                let final_buf = pool.get_page().unwrap();
                 assert_eq!(final_buf.len(), 4096, "Final allocation failed");
 
                 // Keep initial_ptrs to suppress unused warning
@@ -986,7 +1119,7 @@ mod shuttle_tests {
                 let mut temp_count = 0;
 
                 for i in 0..300 {
-                    let buf = pool.get_page();
+                    let buf = pool.get_page().unwrap();
                     assert_eq!(buf.len(), 4096, "Buffer {} has wrong length", i);
 
                     // Write identifying data
@@ -1038,7 +1171,7 @@ mod shuttle_tests {
                 let h = thread::spawn(move || {
                     let mut new_bufs = Vec::new();
                     for i in 0..50 {
-                        let buf = pool2.get_page();
+                        let buf = pool2.get_page().unwrap();
                         assert_eq!(buf.len(), 4096, "New buffer {} has wrong length", i);
                         // Write new pattern
                         buf.as_mut_slice()[0] = 0xFF;
@@ -1092,7 +1225,7 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         let mut bufs = Vec::new();
                         for buf_id in 0..10u8 {
-                            let buf = pool.get_page();
+                            let buf = pool.get_page().unwrap();
                             assert_eq!(buf.len(), 4096, "Buffer has wrong length");
 
                             // Write thread and buffer identifying data
@@ -1209,7 +1342,7 @@ mod shuttle_tests {
                 for thread_id in 0u8..4 {
                     let pool = Arc::clone(&pool);
                     let h = thread::spawn(move || {
-                        let buf = pool.get_page();
+                        let buf = pool.get_page().unwrap();
                         // Write thread-specific pattern
                         let pattern = thread_id.wrapping_mul(37);
                         for byte in buf.as_mut_slice().iter_mut() {
@@ -1249,9 +1382,9 @@ mod shuttle_tests {
                 let pool = create_test_pool();
 
                 // Allocate multiple buffers and write identifying data
-                let buf1 = pool.get_page();
-                let buf2 = pool.get_page();
-                let buf3 = pool.get_page();
+                let buf1 = pool.get_page().unwrap();
+                let buf2 = pool.get_page().unwrap();
+                let buf3 = pool.get_page().unwrap();
 
                 buf1.as_mut_slice()[0] = 0x11;
                 buf2.as_mut_slice()[0] = 0x22;
@@ -1278,7 +1411,7 @@ mod shuttle_tests {
 
                 // Thread 3: allocate while others are dropping
                 let h3 = thread::spawn(move || {
-                    let new_buf = pool3.get_page();
+                    let new_buf = pool3.get_page().unwrap();
                     assert_eq!(new_buf.len(), 4096, "New buffer has wrong length");
                     new_buf.as_mut_slice()[0] = 0x44;
                     new_buf
@@ -1296,7 +1429,7 @@ mod shuttle_tests {
 
                 // Original pool reference keeps arena alive
                 // Allocate more to verify arena is still functional
-                let final_buf = pool.get_page();
+                let final_buf = pool.get_page().unwrap();
                 assert_eq!(final_buf.len(), 4096, "Final allocation failed");
                 final_buf.as_mut_slice()[0] = 0x55;
                 assert_eq!(final_buf.as_slice()[0], 0x55, "Final buffer write failed");
@@ -1326,7 +1459,7 @@ mod shuttle_tests {
                         let mut bufs = Vec::new();
                         // Allocate 5 buffers
                         for i in 0..5u8 {
-                            let buf = pool.get_page();
+                            let buf = pool.get_page().unwrap();
                             assert_eq!(
                                 buf.len(),
                                 4096,
@@ -1356,7 +1489,7 @@ mod shuttle_tests {
 
                         // Allocate 3 more
                         for i in 0..3u8 {
-                            let buf = pool.get_page();
+                            let buf = pool.get_page().unwrap();
                             assert_eq!(
                                 buf.len(),
                                 4096,
@@ -1448,7 +1581,7 @@ mod shuttle_tests {
                 // Try allocating more to verify arena is consistent
                 let mut final_bufs = Vec::new();
                 for i in 0..10 {
-                    let buf = pool.get_page();
+                    let buf = pool.get_page().unwrap();
                     assert_eq!(buf.len(), 4096, "Final buf {} wrong length", i);
                     buf.as_mut_slice()[0] = 0xFF;
                     buf.as_mut_slice()[1] = i as u8;
@@ -1489,7 +1622,7 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         let mut bufs = Vec::new();
                         for i in 0..5u8 {
-                            let buf = pool.get_page();
+                            let buf = pool.get_page().unwrap();
                             assert_eq!(buf.len(), 4096, "Page buffer has wrong length");
                             // Mark as page buffer with identifying data
                             buf.as_mut_slice()[0] = 0xAA; // Page marker
@@ -1508,7 +1641,7 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         let mut bufs = Vec::new();
                         for i in 0..5u8 {
-                            let buf = pool.get_wal_frame();
+                            let buf = pool.get_wal_frame().unwrap();
                             assert_eq!(
                                 buf.len(),
                                 4096 + WAL_FRAME_HEADER_SIZE,
@@ -1531,7 +1664,7 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         let mut bufs = Vec::new();
                         for i in 0..5u8 {
-                            let buf = pool.allocate(2048);
+                            let buf = pool.allocate(2048).unwrap();
                             assert_eq!(buf.len(), 2048, "Allocated buffer has wrong length");
                             // Mark as generic allocation
                             buf.as_mut_slice()[0] = 0xCC; // Allocate marker
@@ -1617,9 +1750,9 @@ mod shuttle_tests {
                             // Alternate between page and WAL frame allocations
                             let is_page = (thread_id + iter) % 2 == 0;
                             let buf = if is_page {
-                                pool.get_page()
+                                pool.get_page().unwrap()
                             } else {
-                                pool.get_wal_frame()
+                                pool.get_wal_frame().unwrap()
                             };
 
                             // Verify length matches allocation type
@@ -1756,7 +1889,7 @@ mod shuttle_tests {
                 );
 
                 // Final allocation to verify pool is still healthy
-                let final_buf = pool.get_page();
+                let final_buf = pool.get_page().unwrap();
                 assert_eq!(final_buf.len(), 4096, "Final allocation failed");
                 final_buf.as_mut_slice()[0] = 0xFF;
                 assert_eq!(final_buf.as_slice()[0], 0xFF, "Final buffer write failed");

@@ -3227,7 +3227,7 @@ impl WalFile {
             { "input_len": page.len(), "page_size": page_size }
         );
 
-        let frame = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
+        let frame = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size)?;
         turso_assert!(
             frame.len() == WAL_FRAME_HEADER_SIZE + page_size,
             "WAL frame buffer size must match its header and page body",
@@ -3707,6 +3707,7 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
+        let failed_read = page.clone();
         let page_idx = page.get().id();
         let epoch_at_issue = self.coordination.checkpoint_epoch();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -3737,7 +3738,7 @@ impl Wal for WalFile {
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
         let file = self.coordination.wal_file()?;
-        begin_read_wal_frame(
+        let result = begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
             buffer_pool,
@@ -3745,7 +3746,12 @@ impl Wal for WalFile {
             page_idx,
             &self.io_ctx.read(),
             group,
-        )
+        );
+        if result.is_err() {
+            failed_read.clear_locked();
+            failed_read.clear_wal_tag();
+        }
+        result
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3795,13 +3801,18 @@ impl Wal for WalFile {
                     { "page_id": page.get().id() }
                 );
             }
-            page.set_locked();
-            slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
+            slots.push((page.clone(), Arc::new(buffer_pool.get_page()?)));
         }
 
         let epoch = self.coordination.checkpoint_epoch();
         let page_transform = self.io_ctx.read().page_transform().clone();
-        let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
+        let raw_buf = match scratch_buf {
+            Some(buffer) => buffer,
+            None => Arc::new(buffer_pool.allocate(total)?),
+        };
+        for (page, _) in &slots {
+            page.set_locked();
+        }
 
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let clear_slots_on_err = |slots: &[(PageRef, Arc<Buffer>)]| {
@@ -6563,7 +6574,7 @@ pub mod test {
     }
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
-        let page = allocate_new_page(page_id, buffer_pool);
+        let page = allocate_new_page(page_id, buffer_pool).unwrap();
         for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
             *byte = seed.wrapping_add(idx as u8).wrapping_add(page_id as u8);
         }
@@ -7355,7 +7366,8 @@ pub mod test {
             7,
             1,
             &page,
-        );
+        )
+        .unwrap();
         let c = file
             .pwrite(
                 WAL_HEADER_SIZE as u64,

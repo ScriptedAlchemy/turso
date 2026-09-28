@@ -15,7 +15,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
-        plan::TableReferences,
+        plan::{Operation, TableReferences},
     },
     Result,
 };
@@ -400,6 +400,21 @@ pub fn resolve_comparison_collseq_with_resolver(
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
+/// Synthetic index outputs retain the collation semantics of their source expression.
+fn index_method_output<'a>(expr: &Expr, tables: &'a TableReferences) -> Option<&'a Expr> {
+    let Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    let table = tables.find_joined_table_by_internal_id(*table)?;
+    let Operation::IndexMethodQuery(query) = &table.op else {
+        return None;
+    };
+    query
+        .covered_expressions
+        .iter()
+        .find_map(|(expr, id)| (*id == *column).then_some(expr))
+}
+
 /// Return the collation context that standalone expression translation would
 /// propagate to a parent comparison when this expression is reused from cache.
 ///
@@ -417,6 +432,18 @@ pub fn get_expr_collation_ctx_with_symbols(
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Some(source) = index_method_output(expr, referenced_tables) {
+            if let Some((collation, explicit)) =
+                get_expr_collation_ctx_with_symbols(source, referenced_tables, symbol_table)?
+            {
+                if explicit {
+                    maybe_explicit_collseq.get_or_insert(collation);
+                } else {
+                    maybe_column_collseq.get_or_insert(collation);
+                }
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         match expr {
             Expr::Collate(_, seq) => {
                 if maybe_explicit_collseq.is_none() {
@@ -498,6 +525,10 @@ fn comparison_operand_column_collseq(
 ) -> Result<Option<CollationSeq>> {
     let mut expr = top_expr;
     loop {
+        if let Some(source) = index_method_output(expr, referenced_tables) {
+            expr = source;
+            continue;
+        }
         match expr {
             Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = exprs[0].as_ref(),
             Expr::Unary(turso_parser::ast::UnaryOperator::Positive, sub_expr) => {
@@ -546,6 +577,17 @@ fn get_collseq_parts_from_expr_with_symbols(
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Some(source) = index_method_output(expr, referenced_tables) {
+            let (explicit, column) = get_collseq_parts_from_expr_with_symbols(
+                source,
+                referenced_tables,
+                symbol_table,
+                resolver,
+            )?;
+            maybe_explicit_collseq = maybe_explicit_collseq.or(explicit);
+            maybe_column_collseq = maybe_column_collseq.or(column);
+            return Ok(WalkControl::SkipChildren);
+        }
         match expr {
             Expr::Collate(_, seq) => {
                 // Only store the first (leftmost) COLLATE operator we find

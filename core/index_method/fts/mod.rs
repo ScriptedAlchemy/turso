@@ -21,10 +21,11 @@ use crate::alloc::DynAllocator;
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
+    Connection, LimboError, Result, Value,
     index_method::{
-        parse_patterns, BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp,
-        BackingTable, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
-        IndexMethodContext, IndexMethodCursor, IndexMethodDefinition,
+        BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp, BackingTable,
+        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext,
+        IndexMethodCursor, IndexMethodDefinition, parse_patterns,
     },
     return_if_io,
     schema::IndexColumn,
@@ -33,18 +34,18 @@ use crate::{
     turso_assert,
     types::{IOResult, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
-    Connection, LimboError, Result, Value,
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tantivy::{
-    directory::RamDirectory,
+    DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader, TERMINATED,
+    TantivyDocument, Term,
+    directory::{OwnedBytes, RamDirectory},
     fastfield::Column,
     index::SegmentId,
     indexer::{AddOperation, SegmentWriter},
@@ -54,28 +55,26 @@ use tantivy::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
     },
-    DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
-    TantivyDocument, Term, TERMINATED,
 };
 use turso_parser::ast::{Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
 mod format;
+mod prefix;
 mod rows;
 
-use directory::{BuildDirectory, SnapshotDirectory};
+use directory::{BuildDirectory, SnapshotDirectory, StagedFile};
 use format::{
-    alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
-    segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
-    tombstone_del_file_name, with_tantivy_footer, ControlRecord, DocumentIdentity, FtsControl,
-    LoadedSegment, SegmentData, SegmentDescriptor, SegmentFileEntry, SegmentIdentities,
-    SegmentMetaSpec, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
-    FTS_STORAGE_FORMAT_VERSION,
+    ControlRecord, DeletedDocs, DocumentIdentity, FTS_STORAGE_FORMAT_VERSION, FTS2_CONTROL_PATH,
+    FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX, FtsControl, LoadedSegment,
+    SegmentData, SegmentDescriptor, SegmentFileEntry, SegmentIdentities, SegmentMetaSpec,
+    document_tombstone_path, parse_document_identity, parse_segment_id, segment_chunk_path,
+    segment_chunk_prefix, segment_registry_path, synthesize_meta_json, tombstone_del_file_name,
 };
 use rows::{
-    chunk_rows, row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter,
-    SegmentClaimer,
+    PathTarget, PendingRow, RowDeleter, RowInserter, SegmentClaimer, chunk_rows, row_fields,
+    seek_key_for_path,
 };
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
@@ -146,18 +145,14 @@ const FTS_MAX_QUERY_BYTES: usize = 16 * 1024;
 /// recursive parser against stack overflow.
 const FTS_MAX_QUERY_NESTING: usize = 64;
 
-/// Maximum assembled searchers retained per FTS attachment. Entries are
+/// Maximum weak searcher entries per FTS attachment. Live entries are
 /// keyed by the visible segment set (plus per-segment tombstone state), so
 /// any snapshot seeing the same set shares one entry.
 const FTS_MAX_CACHED_SEARCHERS: usize = 4;
 
-/// Aggregate resident byte budget for the shared per-segment cache.
-///
-/// This bounds only what is *retained for reuse* after a statement
-/// finishes. It is not a bound on live memory: a cursor keeps every visible
-/// segment resident while it runs, however large the index is, because
-/// Tantivy reads through synchronous callbacks that cannot fall back to
-/// storage I/O.
+/// Logical file-byte budget retained by the shared mapped-segment cache.
+/// Active snapshots can pin evicted mappings. This does not bound total RSS,
+/// filesystem cache residency, or Tantivy decoder allocations.
 const FTS_MAX_RETAINED_CACHE_BYTES: usize = 192 * 1024 * 1024;
 
 #[cfg(feature = "test_helper")]
@@ -428,13 +423,8 @@ struct FtsRuntimeStats {
     merge_segments_skipped: AtomicUsize,
 }
 
-/// Shared per-segment byte cache: segment id → resident file bytes.
-///
-/// A segment's bytes never change, so entries need no snapshot identity and
-/// are shared by every connection. Uncommitted segments may be inserted by
-/// their writing transaction: their ids are unguessable and only
-/// discoverable through visible registry rows, so other snapshots can never
-/// look them up; rollback purges them.
+/// Shared immutable segment mappings, bounded by logical file bytes.
+/// Active queries may keep evicted mappings alive until their snapshots close.
 #[derive(Debug, Default)]
 struct SegmentByteCache {
     /// Least recently used first.
@@ -456,13 +446,21 @@ impl SegmentByteCache {
         Some(data)
     }
 
-    fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
-        self.entries.retain(|(entry, _)| *entry != id);
-        self.entries.push((id, data));
-        // Always keep the newest entry; evict older ones to fit the budget.
-        while self.entries.len() > 1 && self.total_bytes() > budget {
+    fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) -> Arc<SegmentData> {
+        while self.total_bytes() > budget {
             self.entries.remove(0);
         }
+        if let Some(existing) = self.get(&id) {
+            return existing;
+        }
+        if data.total_bytes > budget {
+            return data;
+        }
+        while self.total_bytes() > budget - data.total_bytes {
+            self.entries.remove(0);
+        }
+        self.entries.push((id, Arc::clone(&data)));
+        data
     }
 
     fn remove(&mut self, id: &SegmentId) {
@@ -473,21 +471,25 @@ impl SegmentByteCache {
 /// Cache identity of one assembled searcher: the visible segment set with
 /// each segment's tombstone state. Exact comparison — a wrong reuse would
 /// silently produce wrong query results.
-type SearcherKey = Vec<(SegmentId, u32, BTreeSet<u32>)>;
+type SearcherKey = Vec<(SegmentId, u32, OwnedBytes)>;
 
-fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
-    let mut key: SearcherKey = segments
+fn searcher_key(segments: &[LoadedSegment]) -> Result<SearcherKey> {
+    let mut key = segments
         .iter()
         .map(|segment| {
-            (
+            Ok((
                 segment.id(),
                 segment.descriptor.max_doc,
-                segment.deleted.clone(),
-            )
+                if segment.deleted.is_empty() {
+                    OwnedBytes::empty()
+                } else {
+                    segment.deleted.alive_file()?
+                },
+            ))
         })
-        .collect();
+        .collect::<Result<SearcherKey>>()?;
     key.sort_by_key(|(id, _, _)| id.uuid_string());
-    key
+    Ok(key)
 }
 
 struct SearcherCacheEntry {
@@ -501,28 +503,36 @@ struct SearcherCacheEntry {
 #[derive(Default)]
 struct SearcherCache {
     /// Least recently used first.
-    entries: Vec<SearcherCacheEntry>,
+    entries: Vec<Weak<SearcherCacheEntry>>,
 }
 
 impl SearcherCache {
-    fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
-        let position = self.entries.iter().position(|entry| &entry.key == key)?;
-        let entry = self.entries.remove(position);
-        self.entries.push(entry);
-        self.entries.last()
+    fn get(&mut self, key: &SearcherKey) -> Option<Arc<SearcherCacheEntry>> {
+        self.entries.retain(|entry| entry.strong_count() > 0);
+        self.entries
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|entry| &entry.key == key)
     }
 
-    fn put(&mut self, entry: SearcherCacheEntry) {
-        self.entries.retain(|existing| existing.key != entry.key);
-        self.entries.push(entry);
+    fn put(&mut self, entry: &Arc<SearcherCacheEntry>) {
+        self.entries.retain(|existing| {
+            existing
+                .upgrade()
+                .is_some_and(|value| value.key != entry.key)
+        });
+        self.entries.push(Arc::downgrade(entry));
         while self.entries.len() > FTS_MAX_CACHED_SEARCHERS {
             self.entries.remove(0);
         }
     }
 
     fn purge_segments(&mut self, ids: &[SegmentId]) {
-        self.entries
-            .retain(|entry| !entry.key.iter().any(|(id, _, _)| ids.contains(id)));
+        self.entries.retain(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|entry| !entry.key.iter().any(|(id, _, _)| ids.contains(id)))
+        });
     }
 }
 
@@ -602,7 +612,8 @@ pub struct FtsIndexAttachment {
 
 /// Supported tokenizer names for FTS indexes
 pub const SUPPORTED_TOKENIZERS: &[&str] = &[
-    "default",    // Tantivy default: lowercase + punctuation split + 40 char limit
+    "default", // Tantivy default: lowercase + punctuation split + 40 char limit
+    "unicode",
     "raw",        // No tokenization - exact match only
     "simple",     // Basic whitespace/punctuation split
     "whitespace", // Split on whitespace only
@@ -732,8 +743,10 @@ impl FtsIndexAttachment {
         );
         let identity_hi_field =
             schema_builder.add_u64_field(IDENTITY_HI_FIELD, tantivy::schema::FAST);
-        let identity_lo_field =
-            schema_builder.add_u64_field(IDENTITY_LO_FIELD, tantivy::schema::FAST);
+        let identity_lo_field = schema_builder.add_u64_field(
+            IDENTITY_LO_FIELD,
+            tantivy::schema::FAST | tantivy::schema::INDEXED,
+        );
 
         let mut text_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
@@ -909,7 +922,7 @@ enum FtsState {
         queue: Vec<usize>,
         pos: usize,
         /// file_ord -> (chunk_no -> bytes) for the segment at `queue[pos]`.
-        chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
+        chunks: HashMap<u32, StagedFile>,
         seeked: bool,
         advance_pending: bool,
     },
@@ -1034,7 +1047,7 @@ pub struct FtsCursor {
     backing: Option<BackingStore>,
 
     control: Option<FtsControl>,
-    /// The snapshot's visible segment set (descriptors + resident bytes +
+    /// The snapshot's visible segment set (descriptors + mapped bytes +
     /// tombstone state), including this transaction's own published
     /// segments. Valid once `snapshot_loaded`.
     segments: Vec<LoadedSegment>,
@@ -1043,7 +1056,7 @@ pub struct FtsCursor {
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
     /// Identities of every visible tombstone row.
-    scan_tombs: HashSet<DocumentIdentity>,
+    scan_tombs: Option<StagedFile>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
     /// When true, `open` stops after format detection instead of loading
     /// the snapshot (the insert fast path).
@@ -1054,6 +1067,7 @@ pub struct FtsCursor {
     reader: Option<IndexReader>,
     searcher: Option<Searcher>,
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    cached_view: Option<Arc<SearcherCacheEntry>>,
     rowid_readers: Arc<[Column<i64>]>,
 
     // Write buffers.
@@ -1123,13 +1137,14 @@ impl FtsCursor {
             segments: Vec::new(),
             snapshot_loaded: false,
             scan_descriptors: Vec::new(),
-            scan_tombs: HashSet::default(),
+            scan_tombs: None,
             scan_data: HashMap::default(),
             probe_only: false,
             index: None,
             reader: None,
             searcher: None,
             cached_parser: None,
+            cached_view: None,
             rowid_readers: Arc::default(),
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
@@ -1214,6 +1229,28 @@ impl FtsCursor {
         }
     }
 
+    fn staging_directory(&self) -> Result<PathBuf> {
+        if let Some(connection) = self.connection.as_ref().and_then(Weak::upgrade) {
+            let path = std::path::Path::new(connection.db_file_path());
+            return Ok(path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf());
+        }
+        #[cfg(test)]
+        {
+            std::env::current_dir()
+                .map_err(|error| crate::error::io_error(error, "resolve FTS test directory"))
+        }
+        #[cfg(not(test))]
+        {
+            Err(LimboError::InternalError(
+                "FTS staging has no connection".into(),
+            ))
+        }
+    }
+
     /// Open the backing B-tree cursor for the FTS row store.
     fn open_cursor(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<()> {
         if self.fts_dir_cursor.is_some() {
@@ -1234,6 +1271,13 @@ impl FtsCursor {
     /// Register custom tokenizers with a Tantivy index.
     fn register_tokenizers(&self, index: &Index) {
         let tokenizers = index.tokenizers();
+        tokenizers.register(
+            "unicode",
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(tantivy::tokenizer::LowerCaser)
+                .filter(tantivy::tokenizer::AsciiFoldingFilter)
+                .build(),
+        );
         tokenizers.register("raw", RawTokenizer::default());
         tokenizers.register("simple", SimpleTokenizer::default());
         tokenizers.register("whitespace", WhitespaceTokenizer::default());
@@ -1253,6 +1297,7 @@ impl FtsCursor {
 
     fn build_query_parser(&self, index: &Index) -> Arc<tantivy::query::QueryParser> {
         let mut parser = tantivy::query::QueryParser::for_index(index, self.default_fields.clone());
+        parser.allow_regexes();
         for &(field, boost) in &self.field_boosts {
             parser.set_field_boost(field, boost);
         }
@@ -1261,9 +1306,9 @@ impl FtsCursor {
 
     /// Assemble the Tantivy view (index, reader, searcher, parser) over the
     /// cursor's in-memory segment set, consulting the shared searcher cache
-    /// first. Pure CPU work — every byte is already resident.
+    /// first. Segment mappings are already available to Tantivy.
     fn build_snapshot_view(&mut self, publish_to_cache: bool) -> Result<()> {
-        let key = searcher_key(&self.segments);
+        let key = searcher_key(&self.segments)?;
         self.shared
             .stats
             .read_cache_lookups
@@ -1278,6 +1323,7 @@ impl FtsCursor {
             self.reader = Some(entry.reader.clone());
             self.cached_parser = Some(Arc::clone(&entry.parser));
             self.rowid_readers = Arc::clone(&entry.rowid_readers);
+            self.cached_view = Some(entry);
             return Ok(());
         }
         self.shared
@@ -1285,10 +1331,10 @@ impl FtsCursor {
             .read_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut files: HashMap<PathBuf, Arc<[u8]>> = HashMap::default();
+        let mut files: HashMap<PathBuf, OwnedBytes> = HashMap::default();
         for segment in &self.segments {
             for (name, data) in &segment.data.files {
-                files.insert(PathBuf::from(name), Arc::clone(data));
+                files.insert(PathBuf::from(name), data.clone());
             }
             if !segment.deleted.is_empty() {
                 // Serve the tombstone set as the segment's `.del` file so
@@ -1296,10 +1342,12 @@ impl FtsCursor {
                 // and every query path honors it.
                 files.insert(
                     PathBuf::from(tombstone_del_file_name(&segment.id())),
-                    Arc::from(with_tantivy_footer(alive_bitset_bytes(
-                        segment.descriptor.max_doc,
-                        &segment.deleted,
-                    ))?),
+                    key.iter()
+                        .find(|(id, _, _)| *id == segment.id())
+                        .map(|(_, _, bytes)| bytes.clone())
+                        .ok_or_else(|| {
+                            LimboError::InternalError("FTS deletion file missing".into())
+                        })?,
                 );
             }
         }
@@ -1331,13 +1379,15 @@ impl FtsCursor {
             })
             .collect::<Result<_>>()?;
         if publish_to_cache {
-            self.shared.searchers.lock().put(SearcherCacheEntry {
+            let entry = Arc::new(SearcherCacheEntry {
                 key,
                 index: index.clone(),
                 reader: IndexReader::clone(&reader),
                 parser: Arc::clone(&parser),
                 rowid_readers: Arc::clone(&rowid_readers),
             });
+            self.shared.searchers.lock().put(&entry);
+            self.cached_view = Some(entry);
         }
         self.searcher = Some(searcher);
         self.index = Some(index);
@@ -1363,6 +1413,7 @@ impl FtsCursor {
         self.reader = None;
         self.searcher = None;
         self.cached_parser = None;
+        self.cached_view = None;
         self.rowid_readers = Arc::default();
     }
 
@@ -1395,12 +1446,13 @@ impl FtsCursor {
         let database_id = self.database_id.ok_or_else(|| {
             LimboError::InternalError("FTS database id is not initialized".to_string())
         })?;
+        let staging_directory = self.staging_directory()?;
         loop {
             match &mut self.state {
                 FtsState::Init => {
                     self.open_cursor(&conn, database_id)?;
                     self.scan_descriptors.clear();
-                    self.scan_tombs.clear();
+                    self.scan_tombs = None;
                     self.scan_data.clear();
                     self.state = FtsState::SeekControl;
                 }
@@ -1655,7 +1707,16 @@ impl FtsCursor {
                         ))
                         .into());
                     };
-                    self.scan_tombs.insert(parse_document_identity(identity)?);
+                    if self.scan_tombs.is_none() {
+                        self.scan_tombs = Some(StagedFile::new(&staging_directory)?);
+                    }
+                    let file = self.scan_tombs.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("FTS tombstone staging missing".into())
+                    })?;
+                    file.append(
+                        i64::from(file.chunks),
+                        &parse_document_identity(identity)?.raw().to_le_bytes(),
+                    )?;
                     *advance_pending = true;
                 }
                 FtsState::LoadChunks {
@@ -1702,17 +1763,31 @@ impl FtsCursor {
                                         "FTS chunk row has malformed file ordinal: {path}"
                                     ))
                                 })?;
-                                if chunks
-                                    .entry(file_ord)
-                                    .or_default()
-                                    .insert(chunk_no, bytes)
-                                    .is_some()
+                                let descriptor = &self.scan_descriptors[descriptor_idx];
+                                let entry =
+                                    descriptor.files.get(file_ord as usize).ok_or_else(|| {
+                                        LimboError::Corrupt(format!(
+                                            "FTS chunk has unknown file ordinal: {path}"
+                                        ))
+                                    })?;
+                                if !chunks.contains_key(&file_ord) {
+                                    chunks.insert(file_ord, StagedFile::new(&staging_directory)?);
+                                }
+                                let file = chunks.get_mut(&file_ord).ok_or_else(|| {
+                                    LimboError::InternalError("FTS staging file disappeared".into())
+                                })?;
+                                if file.chunks >= entry.num_chunks
+                                    || file
+                                        .bytes
+                                        .checked_add(bytes.len() as u64)
+                                        .is_none_or(|size| size > entry.size)
                                 {
                                     return Err(LimboError::Corrupt(format!(
-                                        "duplicate FTS chunk {path}:{chunk_no}"
+                                        "FTS chunk exceeds descriptor: {path}"
                                     ))
                                     .into());
                                 }
+                                file.append(chunk_no, &bytes)?;
                                 *advance_pending = true;
                             }
                             None => segment_done = true,
@@ -1732,9 +1807,9 @@ impl FtsCursor {
                             .stats
                             .segment_loads
                             .fetch_add(1, Ordering::Relaxed);
-                        self.shared.segment_bytes.lock().put(
+                        let data = self.shared.segment_bytes.lock().put(
                             descriptor.segment_id,
-                            Arc::clone(&data),
+                            data,
                             fts_max_retained_cache_bytes(),
                         );
                         self.scan_data.insert(descriptor.segment_id, data);
@@ -1747,7 +1822,12 @@ impl FtsCursor {
                     if !self.snapshot_loaded {
                         // Adopt the scan results as the visible set.
                         let descriptors = std::mem::take(&mut self.scan_descriptors);
-                        let tombs = std::mem::take(&mut self.scan_tombs);
+                        let tombs = self
+                            .scan_tombs
+                            .take()
+                            .map(StagedFile::finish)
+                            .transpose()?
+                            .unwrap_or_else(OwnedBytes::empty);
                         let mut data_by_id = std::mem::take(&mut self.scan_data);
                         let mut applied_tombstones = 0usize;
                         self.segments = descriptors
@@ -1764,12 +1844,19 @@ impl FtsCursor {
                                 // segment. Find the position of each visible
                                 // tombstone in this segment. A merge can
                                 // move the document after the delete.
-                                let deleted = data.identities.tombstoned_positions(&tombs);
+                                let deleted = data.identities.tombstoned_positions(
+                                    tombs.chunks_exact(16).map(|bytes| {
+                                        let mut raw = [0u8; 16];
+                                        raw.copy_from_slice(bytes);
+                                        DocumentIdentity::new(u128::from_le_bytes(raw))
+                                    }),
+                                    &staging_directory,
+                                )?;
                                 applied_tombstones += deleted.len();
                                 Ok(LoadedSegment::new(descriptor, data, deleted))
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        if applied_tombstones < tombs.len() {
+                        if applied_tombstones < tombs.len() / 16 {
                             // A tombstone that names no visible document.
                             // A merge deletes the tombstones of the
                             // documents it drops, and nobody can delete a
@@ -1778,7 +1865,7 @@ impl FtsCursor {
                             // produces these. Skipping them is harmless,
                             // but they must not vanish silently.
                             tracing::warn!(
-                                tombstones = tombs.len(),
+                                tombstones = tombs.len() / 16,
                                 applied = applied_tombstones,
                                 "FTS store has tombstone rows naming no visible document"
                             );
@@ -1939,11 +2026,6 @@ impl FtsCursor {
             if let Some(segment) = segment {
                 inserts.extend(rows);
                 self.own_published.push(segment.id());
-                self.shared.segment_bytes.lock().put(
-                    segment.id(),
-                    Arc::clone(&segment.data),
-                    fts_max_retained_cache_bytes(),
-                );
                 new_segment = Some(segment);
             }
         }
@@ -2024,13 +2106,21 @@ impl FtsCursor {
             .segment_builds
             .fetch_add(1, Ordering::Relaxed);
 
-        let identities = SegmentIdentities::new(
-            (0..max_doc)
-                .map(|position| identity_base.plus(position))
-                .collect(),
-        );
         let captured = build_dir.captured_files();
-        segment_rows_from_files(segment_id, max_doc, captured, identities)
+        let identities = read_segment_identities(
+            &self.shared.scratch_index(&self.schema)?,
+            &self.schema,
+            segment_id,
+            max_doc,
+            captured.clone(),
+        )?;
+        segment_rows_from_files(
+            segment_id,
+            max_doc,
+            captured,
+            identities,
+            &self.staging_directory()?,
+        )
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,
@@ -2190,8 +2280,13 @@ impl FtsCursor {
                 merged_meta.max_doc(),
                 captured.clone(),
             )?;
-            let (segment, rows) =
-                segment_rows_from_files(segment_id, merged_meta.max_doc(), captured, identities)?;
+            let (segment, rows) = segment_rows_from_files(
+                segment_id,
+                merged_meta.max_doc(),
+                captured,
+                identities,
+                &self.staging_directory()?,
+            )?;
             self.shared
                 .stats
                 .segment_builds
@@ -2231,7 +2326,7 @@ impl FtsCursor {
                 );
                 self.shared.segment_bytes.lock().remove(&id);
             } else {
-                new_segments.push(segment.clone());
+                new_segments.push(segment.try_clone()?);
             }
         }
         let mut inserts = Vec::new();
@@ -2244,11 +2339,6 @@ impl FtsCursor {
             );
             inserts = rows;
             self.own_published.push(segment.id());
-            self.shared.segment_bytes.lock().put(
-                segment.id(),
-                Arc::clone(&segment.data),
-                fts_max_retained_cache_bytes(),
-            );
             new_segments.push(segment);
         }
         self.publish = Some(PendingPublish {
@@ -2418,7 +2508,7 @@ impl FtsCursor {
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
-        self.scan_tombs.clear();
+        self.scan_tombs = None;
         self.scan_data.clear();
         self.control = None;
         self.invalidate_snapshot_view();
@@ -2433,18 +2523,18 @@ impl FtsCursor {
     }
 }
 
-/// Load one segment's resident state from its assembled files: the bytes
+/// Load one segment's mapped state from its assembled files: the bytes
 /// and the document identities read from the identity fast field.
 fn segment_data_from_files(
     shared: &FtsShared,
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<String, Arc<[u8]>>,
+    files: HashMap<String, OwnedBytes>,
 ) -> Result<SegmentData> {
     let by_path = files
         .iter()
-        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
         .collect();
     let identities = read_segment_identities(
         &shared.scratch_index(schema)?,
@@ -2465,7 +2555,7 @@ fn read_segment_identities(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, OwnedBytes>,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
     let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
@@ -2491,118 +2581,43 @@ fn read_segment_identities(
             segment_id.uuid_string()
         ))
     })?;
-    let by_position = (0..max_doc)
-        .map(|position| {
-            hi.first(position)
-                .zip(lo.first(position))
-                .map(|(hi, lo)| DocumentIdentity::new((u128::from(hi) << 64) | u128::from(lo)))
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "FTS segment {} document {position} has no identity",
-                        segment_id.uuid_string()
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(SegmentIdentities::new(by_position))
+    let field = schema
+        .get_field(IDENTITY_LO_FIELD)
+        .map_err(|error| LimboError::Corrupt(format!("FTS identity field: {error}")))?;
+    let index = reader
+        .inverted_index(field)
+        .map_err(|error| LimboError::Corrupt(format!("FTS identity index: {error}")))?;
+    Ok(SegmentIdentities::new(hi, lo, index, field, max_doc))
 }
 
 /// Assemble one segment's files from its scanned chunk rows, validating
 /// them against the descriptor.
 fn assemble_segment_files(
     descriptor: &SegmentDescriptor,
-    mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<HashMap<String, Arc<[u8]>>> {
-    let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    mut chunks: HashMap<u32, StagedFile>,
+) -> Result<HashMap<String, OwnedBytes>> {
+    let mut files = HashMap::default();
     for (file_ord, entry) in descriptor.files.iter().enumerate() {
-        let file_ord = file_ord as u32;
-        let chunk_map = chunks.remove(&file_ord).ok_or_else(|| {
+        let file = chunks.remove(&(file_ord as u32)).ok_or_else(|| {
             LimboError::Corrupt(format!(
-                "FTS segment {} is missing chunks for file {}",
-                descriptor.segment_id.uuid_string(),
+                "FTS segment is missing chunks for file {}",
                 entry.name
             ))
         })?;
-        if chunk_map.len() != entry.num_chunks as usize {
+        if file.chunks != entry.num_chunks || file.bytes != entry.size {
             return Err(LimboError::Corrupt(format!(
-                "FTS segment file {} has {} chunks but the descriptor records {}",
-                entry.name,
-                chunk_map.len(),
-                entry.num_chunks
+                "FTS file {} differs from its chunk/length descriptor",
+                entry.name
             )));
         }
-        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map)?;
-        if assembled.len() as u64 != entry.size {
-            return Err(LimboError::Corrupt(format!(
-                "FTS segment file {} has {} bytes but the descriptor records {}",
-                entry.name,
-                assembled.len(),
-                entry.size
-            )));
-        }
-        files.insert(entry.name.clone(), assembled);
+        files.insert(entry.name.clone(), file.finish()?);
     }
     if !chunks.is_empty() {
-        return Err(LimboError::Corrupt(format!(
-            "FTS segment {} stores chunks for files absent from its descriptor",
-            descriptor.segment_id.uuid_string()
-        )));
+        return Err(LimboError::Corrupt(
+            "FTS segment stores undescribed files".into(),
+        ));
     }
     Ok(files)
-}
-
-/// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-///
-/// The chunks are written straight into the shared allocation: building a
-/// `Vec` first and converting it with `Arc::from` would copy every byte a
-/// second time and hold both copies at once. Each chunk is dropped as soon
-/// as it has been copied, so peak memory is the file plus one chunk.
-fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
-    let max_chunk =
-        chunks.keys().max().copied().ok_or_else(|| {
-            LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
-        })?;
-    if max_chunk < 0 {
-        return Err(LimboError::Corrupt(format!(
-            "FTS file {} has a negative chunk number",
-            path.display()
-        )));
-    }
-    let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
-    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
-    let mut offset = 0;
-    for chunk_no in 0..=max_chunk {
-        let data = chunks.remove(&chunk_no).ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "FTS file {} is missing chunk {}",
-                path.display(),
-                chunk_no
-            ))
-        })?;
-        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
-            slot.write(*byte);
-        }
-        offset += data.len();
-    }
-    if !chunks.is_empty() {
-        // Keys outside `0..=max_chunk` (a negative chunk number next to
-        // valid ones) were counted into `total` but never written.
-        return Err(LimboError::Corrupt(format!(
-            "FTS file {} has chunk numbers outside 0..={}",
-            path.display(),
-            max_chunk
-        )));
-    }
-    turso_assert!(
-        offset == total,
-        "FTS chunk assembly must write exactly the bytes it counted"
-    );
-    // SAFETY: `total` is the sum of every chunk's length and every chunk was
-    // consumed by the loop above exactly once, writing `total` bytes
-    // contiguously from offset 0 (asserted), so every byte of the slice is
-    // initialized.
-    Ok(unsafe { assembled.assume_init() })
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2611,10 +2626,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
 fn rename_segment_files(
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, OwnedBytes>,
     from: &SegmentId,
     to: &SegmentId,
-) -> Result<HashMap<PathBuf, Arc<[u8]>>> {
+) -> Result<HashMap<PathBuf, OwnedBytes>> {
     let from = from.uuid_string();
     let to = to.uuid_string();
     files
@@ -2637,8 +2652,9 @@ fn rename_segment_files(
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
-    captured: HashMap<PathBuf, Arc<[u8]>>,
+    captured: HashMap<PathBuf, OwnedBytes>,
     identities: SegmentIdentities,
+    directory: &std::path::Path,
 ) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
     let mut file_names: Vec<String> = captured
         .keys()
@@ -2648,7 +2664,7 @@ fn segment_rows_from_files(
     file_names.sort();
     let mut inserts = Vec::new();
     let mut entries = Vec::new();
-    let mut data_files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    let mut data_files: HashMap<String, OwnedBytes> = HashMap::default();
     for (file_ord, name) in file_names.into_iter().enumerate() {
         let bytes = captured
             .get(std::path::Path::new(&name))
@@ -2663,7 +2679,7 @@ fn segment_rows_from_files(
             num_chunks: rows.len() as u32,
         });
         inserts.extend(rows);
-        data_files.insert(name, Arc::clone(bytes));
+        data_files.insert(name, bytes.clone());
     }
     let descriptor = SegmentDescriptor {
         segment_id,
@@ -2678,7 +2694,7 @@ fn segment_rows_from_files(
     let segment = LoadedSegment::new(
         descriptor,
         Arc::new(SegmentData::new(data_files, identities)),
-        BTreeSet::new(),
+        DeletedDocs::new(max_doc, directory),
     );
     Ok((Some(segment), inserts))
 }
@@ -2985,7 +3001,7 @@ impl IndexMethodCursor for FtsCursor {
                 .iter_mut()
                 .find(|segment| segment.id() == segment_id)
             {
-                if segment.deleted.insert(doc_id) {
+                if segment.deleted.insert(doc_id)? {
                     let identity =
                         segment.data.identities.identity_of(doc_id).ok_or_else(|| {
                             LimboError::Corrupt(format!(
@@ -3111,10 +3127,17 @@ impl IndexMethodCursor for FtsCursor {
                 _ => {}
             }
         }
-        let (query, parse_errors) = parser.parse_query_lenient(&query_str);
-        if let Some(error) = parse_errors.first() {
-            return Err(LimboError::InternalError(format!("FTS parse error: {error:?}")).into());
-        }
+        let index = self.index.as_ref().ok_or_else(|| {
+            LimboError::InternalError("FTS query index is unavailable".to_string())
+        })?;
+        let query = prefix::parse_query(
+            parser,
+            index,
+            &self.default_fields,
+            &self.field_boosts,
+            &query_str,
+        )
+        .map_err(|error| LimboError::InternalError(format!("FTS parse error: {error}")))?;
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
         // number of live documents: this preserves unlimited-query semantics
@@ -3596,7 +3619,7 @@ impl IndexMethodCursor for FtsCursor {
         // Cost model:
         // - Load cost: the dominant real cost. A cold query materializes the
         //   visible segments in memory, linear in index bytes. Segments
-        //   resident in the shared byte cache make the load warm.
+        //   mapped in the shared byte cache make the load warm.
         // - Base cost: logarithmic in vocabulary size (approximated by table size)
         // - Posting traversal: stops at LIMIT for unordered streaming patterns
         // - Scoring: omitted for MATCH-only patterns
@@ -3647,10 +3670,18 @@ impl IndexMethodCursor for FtsCursor {
             manifest_file_count: self.snapshot_loaded.then_some(file_count),
             storage_file_count: file_count,
             segment_count: self.snapshot_loaded.then_some(self.segments.len()),
-            cached_connection_count: Some(self.shared.searchers.lock().entries.len()),
+            cached_connection_count: Some(
+                self.shared
+                    .searchers
+                    .lock()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.strong_count() > 0)
+                    .count(),
+            ),
             cached_bytes: Some(self.shared.segment_bytes.lock().total_bytes()),
             cache_admission_rejections: None,
-            // Writers are transaction-private in format v2; there is no
+            // Writers are transaction-private; there is no
             // shared retained writer.
             cached_writer: Some(false),
             tantivy_writer_constructions: Some(stats.segment_builds.load(Ordering::Relaxed)),
@@ -3662,7 +3693,7 @@ impl IndexMethodCursor for FtsCursor {
             read_cache_lookups: Some(stats.read_cache_lookups.load(Ordering::Relaxed)),
             read_cache_hits: Some(stats.read_cache_hits.load(Ordering::Relaxed)),
             read_cache_misses: Some(stats.read_cache_misses.load(Ordering::Relaxed)),
-            // In format v2 the registry scan is cheap and runs per
+            // The registry scan is cheap and runs per
             // snapshot; the expensive part is loading segment bytes, which
             // the shared byte cache avoids. Report byte loads here.
             full_snapshot_loads: Some(stats.segment_loads.load(Ordering::Relaxed)),

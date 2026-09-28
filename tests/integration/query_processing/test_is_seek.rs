@@ -62,6 +62,58 @@ fn is_operator_uses_index_seek() {
 }
 
 #[test]
+fn composite_primary_key_lookup_does_not_scan_a_competing_prefix_index() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE receipts(binding TEXT NOT NULL, digest TEXT NOT NULL, predecessor TEXT NOT NULL, successor TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(binding, digest))",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE INDEX receipt_predecessor ON receipts(binding, predecessor)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE INDEX receipt_successor ON receipts(binding, successor)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<255) INSERT INTO receipts SELECT 'binding', printf('receipt-%04d',x), printf('frontier-%04d',x), printf('frontier-%04d',x+1), printf('payload-%d',x) FROM n",
+    );
+    for index in [0, 127, 255] {
+        let mut statement = conn
+            .prepare("SELECT payload FROM receipts WHERE binding = ?1 AND digest = ?2")
+            .unwrap();
+        statement
+            .bind_at(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                turso_core::Value::Text("binding".into()),
+            )
+            .unwrap();
+        statement
+            .bind_at(
+                std::num::NonZeroUsize::new(2).unwrap(),
+                turso_core::Value::Text(format!("receipt-{index:04}").into()),
+            )
+            .unwrap();
+        let rows = statement.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::Text(
+                format!("payload-{index}").into()
+            )]]
+        );
+        let steps = statement.stmt_status(turso_core::StatementStatusCounter::VmStep);
+        assert!(
+            steps < 128,
+            "receipt {index} used {steps} VM steps instead of seeking its full key"
+        );
+        statement.reset().unwrap();
+    }
+}
+
+#[test]
 fn is_true_and_false_do_not_use_equality_seeks() {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();

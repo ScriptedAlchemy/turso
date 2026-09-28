@@ -16847,6 +16847,14 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    // Text values hold Rust strings; reject malformed encoded text before the
+    // general conversion can irreversibly replace invalid bytes.
+    if matches!(affinity, Affinity::Text) {
+        if let Value::Blob(bytes) = &value {
+            std::str::from_utf8(bytes)
+                .map_err(|error| LimboError::ConversionError(error.to_string()))?;
+        }
+    }
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
@@ -19834,6 +19842,54 @@ mod tests {
         .unwrap();
         let conn = db.connect().unwrap();
         conn.prepare("SELECT 1;").unwrap()
+    }
+
+    #[test]
+    fn readonly_metadata_distinguishes_ephemeral_from_persistent_writes() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        connection.prepare("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap().run_ignore_rows().unwrap();
+        for sql in [
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10) SELECT sum(x) FROM n",
+            "SELECT DISTINCT value FROM items",
+            "SELECT value FROM items UNION SELECT value FROM items",
+        ] {
+            let statement = connection.prepare(sql).unwrap();
+            assert!(statement.get_program().is_readonly(), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO items VALUES(1, 'one')",
+            "UPDATE items SET value='two'",
+            "DELETE FROM items",
+            "CREATE TABLE other(value INTEGER)",
+        ] {
+            let statement = connection.prepare(sql).unwrap();
+            assert!(!statement.get_program().is_readonly(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn cast_blob_to_text_rejects_invalid_utf8_and_preserves_valid_replacement_character() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        for sql in ["SELECT CAST(x'80' AS TEXT)", "SELECT CAST(x'c328' AS TEXT)"] {
+            let mut statement = connection.prepare(sql).unwrap();
+            assert!(matches!(
+                statement.run_ignore_rows(),
+                Err(LimboError::ConversionError(_))
+            ));
+        }
+        let mut statement = connection
+            .prepare("SELECT CAST(x'efbfbd' AS TEXT)")
+            .unwrap();
+        assert!(matches!(statement.step().unwrap(), StepResult::Row));
+        assert_eq!(
+            statement.row().unwrap().get_value(0).to_text().unwrap(),
+            "\u{fffd}"
+        );
     }
 
     fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {

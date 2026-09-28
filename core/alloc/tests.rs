@@ -77,6 +77,7 @@ fn database_allocators_preserve_distinct_concrete_types() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
     let allocators: DatabaseAllocators<Global, CountingAlloc> = DatabaseAllocators {
+        buffer_memory: None,
         mv_store: Global,
         fts: CountingAlloc {
             allocations: allocations.clone(),
@@ -136,6 +137,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
         crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
             .storage(db_file)
             .allocators(DatabaseAllocators {
+                buffer_memory: None,
                 mv_store: alloc,
                 fts: DynAllocator::new(CountingAlloc {
                     allocations: fts_allocations.clone(),
@@ -166,6 +168,7 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
         crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true))
             .allocators(DatabaseAllocators {
+                buffer_memory: None,
                 mv_store: DynAllocator::new(CountingAlloc {
                     allocations: mv_allocations.clone(),
                     deallocations: StdArc::new(AtomicUsize::new(0)),

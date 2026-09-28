@@ -2379,6 +2379,9 @@ impl Insn {
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
     pub fn is_readonly(&self) -> bool {
+        // Cursor mutations may target ephemeral tables used by SELECT (for
+        // example recursive CTE queues). Persistent mutations require OpenWrite
+        // and a write transaction; those opcodes determine writability here.
         match self {
             Self::Checkpoint { .. }
             | Self::VCreate { .. }
@@ -2389,9 +2392,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
             | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
